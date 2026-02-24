@@ -468,6 +468,23 @@ tun_install() {
   fi
 }
 
+tun_root_config_needs_refresh() {
+  local user_cfg root_cfg user_mtime root_mtime
+
+  user_cfg="${SINGBOX_TUN_CONFIG_FILE:-$HOME/.config/dmit-iproyal/sing-box-tun.json}"
+  root_cfg="$ROOT_TUN_CONFIG_FILE"
+  if [ ! -f "$root_cfg" ] && [ -f "$ROOT_TUN_CONFIG_FILE_LEGACY" ]; then
+    root_cfg="$ROOT_TUN_CONFIG_FILE_LEGACY"
+  fi
+
+  [ -f "$user_cfg" ] || return 1
+  [ -f "$root_cfg" ] || return 1
+
+  user_mtime="$(stat -f %m "$user_cfg" 2>/dev/null || echo 0)"
+  root_mtime="$(stat -f %m "$root_cfg" 2>/dev/null || echo 0)"
+  [ "$user_mtime" -gt "$root_mtime" ]
+}
+
 tun_start() {
   local i
 
@@ -478,6 +495,11 @@ tun_start() {
 
   if ! root_tun_install_files_present; then
     echo "TUN privileged service missing or incomplete; attempting install..."
+    tun_install || return 1
+  fi
+
+  if tun_root_config_needs_refresh; then
+    echo "TUN root config is older than user config; reinstalling privileged TUN service..."
     tun_install || return 1
   fi
 
@@ -850,7 +872,7 @@ start_surge() {
 }
 
 ensure_tun_stopped_if_running() {
-  if root_tun_is_running; then
+  if root_tun_is_loaded || root_tun_is_running; then
     tun_stop
   fi
 }
