@@ -83,8 +83,8 @@ cd data-series/dmit-iproyal-stack
 
 - `stack-proxy`: system proxy + local proxy core + shell env
 - `stack-tun`: root TUN + optional proxy core retention for CLI compatibility
-- `surge`: D-ISP proxy off, return control to Surge
-- `direct`: no proxy
+- `surge`: system/browser handoff to Surge, while local `127.0.0.1:17890/17891` bridge to Surge for stale CLI sessions
+- `direct`: no system proxy, while local `127.0.0.1:17890/17891` bridge direct for stale CLI sessions
 
 ## Core Commands
 
@@ -114,6 +114,7 @@ dmit-iproyal-proxyctl tun-repair-gui
 
 - `SOCKS proxy invalid response`: check upstream proxy protocol/account and relay path.
 - `stream disconnected` in CLI after switching: use current codebase defaults (`TUN_KEEP_PROXY_CORE=1`, `TUN_KEEP_SHELL_ENV=1`).
+- Existing terminal still points at old local proxy after switching: current code keeps local proxy ports alive and rewires them to `surge` or `direct` to avoid long hangs; if a command is already blocked, interrupt once and rerun.
 - `403 forbidden`: replace egress IP/provider; this is typically reputation-based.
 
 ## Security

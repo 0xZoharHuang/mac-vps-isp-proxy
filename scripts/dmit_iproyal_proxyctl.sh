@@ -42,6 +42,8 @@ ADMIN_PROMPT="${DMIT_IPROYAL_ADMIN_PROMPT:-0}"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
+UPSTREAM_PROXY_HOST="${UPSTREAM_PROXY_HOST:-${IPROYAL_HOST:-}}"
+
 DEFAULT_BYPASS=(
   "localhost"
   "127.0.0.1"
@@ -56,18 +58,18 @@ DEFAULT_BYPASS=(
   "192.168.0.0/16"
 )
 
-# Health probes (ordered): Cloudflare trace endpoints are usually reachable
-# even when ipify is unstable on local networks.
+# Health probes (ordered): prefer neutral endpoints that work across more
+# commercial proxy providers than provider-owned trace pages.
 PUBLIC_IP_PROBE_URLS=(
-  "https://chatgpt.com/cdn-cgi/trace"
-  "https://www.cloudflare.com/cdn-cgi/trace"
-  "https://api.ipify.org"
+  "https://ifconfig.me/ip"
+  "https://ipv4.icanhazip.com"
+  "https://api64.ipify.org"
 )
 
 HTTPS_CONNECT_PROBE_URLS=(
-  "https://chatgpt.com/"
-  "https://www.cloudflare.com/"
+  "https://example.com/"
   "https://www.apple.com/"
+  "https://api.github.com/"
 )
 
 cli_proxy_mode="${CLI_PROXY_MODE:-http}"
@@ -80,6 +82,8 @@ probe_fast_connect_timeout="${PROBE_FAST_CONNECT_TIMEOUT:-1}"
 probe_fast_max_time="${PROBE_FAST_MAX_TIME:-3}"
 tun_ready_attempts="${TUN_READY_ATTEMPTS:-20}"
 tun_postcheck_attempts="${TUN_POSTCHECK_ATTEMPTS:-12}"
+proxy_core_upstream_mode="${PROXY_CORE_UPSTREAM_MODE:-relay}"
+surge_proxy_wait_attempts="${SURGE_PROXY_WAIT_ATTEMPTS:-20}"
 
 run_admin_cmd() {
   local cmd="$1"
@@ -246,6 +250,69 @@ shell_print_exports() {
   shell_export_block
 }
 
+set_runtime_env_var() {
+  local key="$1" value="$2" tmp
+
+  tmp="$(mktemp)"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { updated=0 }
+    index($0, key "=") == 1 {
+      print key "=" value
+      updated=1
+      next
+    }
+    { print }
+    END {
+      if (updated == 0) {
+        print key "=" value
+      }
+    }
+  ' "$ENV_FILE" >"$tmp"
+  mv "$tmp" "$ENV_FILE"
+}
+
+generate_proxy_core_config() {
+  local generator
+
+  generator="$SCRIPT_DIR/generate_singbox_config.sh"
+  if [ ! -x "$generator" ]; then
+    generator="$HOME/Library/Application Support/dmit-iproyal/bin/generate_singbox_config.sh"
+  fi
+  if [ ! -x "$generator" ]; then
+    generator="$REPO_ROOT/scripts/generate_singbox_config.sh"
+  fi
+
+  if [ ! -x "$generator" ]; then
+    echo "sing-box config generator missing." >&2
+    return 1
+  fi
+
+  DMIT_IPROYAL_ENV_FILE="$ENV_FILE" "$generator"
+  "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG_FILE" >/dev/null
+}
+
+set_proxy_core_upstream_mode() {
+  local mode="${1:-relay}"
+
+  case "$mode" in
+    relay|surge|direct)
+      ;;
+    *)
+      echo "Unsupported proxy core upstream mode: $mode" >&2
+      return 1
+      ;;
+  esac
+
+  set_runtime_env_var "PROXY_CORE_UPSTREAM_MODE" "$mode"
+  PROXY_CORE_UPSTREAM_MODE="$mode"
+  proxy_core_upstream_mode="$mode"
+  generate_proxy_core_config
+
+  if /bin/launchctl print "gui/$UID/$SINGBOX_LABEL" >/dev/null 2>&1; then
+    /bin/launchctl kickstart -k "gui/$UID/$SINGBOX_LABEL" >/dev/null 2>&1 || true
+  fi
+}
+
 is_excluded_service() {
   case "$1" in
     Tailscale|Thunderbolt\ Bridge|iPhone\ USB)
@@ -380,6 +447,10 @@ stop_proxy_core_service() {
   /bin/launchctl bootout "gui/$UID/$SINGBOX_LABEL" >/dev/null 2>&1 || true
 }
 
+stop_tunnel_service() {
+  /bin/launchctl bootout "gui/$UID/$TUNNEL_LABEL" >/dev/null 2>&1 || true
+}
+
 start_services() {
   start_tunnel_service
   start_proxy_core_service
@@ -392,7 +463,21 @@ stop_services() {
 
 restart_services() {
   stop_services
-  "$REPO_ROOT/scripts/setup_dmit_iproyal_stack.sh"
+  local installer
+
+  installer="$SCRIPT_DIR/setup_dmit_iproyal_stack.sh"
+  if [ ! -x "$installer" ]; then
+    installer="$HOME/Library/Application Support/dmit-iproyal/bin/setup_dmit_iproyal_stack.sh"
+  fi
+  if [ ! -x "$installer" ]; then
+    installer="$REPO_ROOT/scripts/setup_dmit_iproyal_stack.sh"
+  fi
+  [ -x "$installer" ] || {
+    echo "Setup installer script missing." >&2
+    return 1
+  }
+
+  "$installer"
 }
 
 wait_proxy_core_ready() {
@@ -843,6 +928,7 @@ info_status() {
   echo "tun_running=$(tun_running_value)"
   echo "surge_running=$(surge_running_value)"
   echo "proxy_core_running=$(proxy_core_running_value)"
+  echo "proxy_core_upstream=${proxy_core_upstream_mode}"
   echo "tunnel_running=$(tunnel_running_value)"
 }
 
@@ -869,6 +955,17 @@ start_surge() {
   if [ -x "$SURGE_CLI" ]; then
     "$SURGE_CLI" reload >/dev/null 2>&1 || true
   fi
+}
+
+wait_surge_proxy_ready() {
+  local i
+  for i in $(seq 1 "$surge_proxy_wait_attempts"); do
+    if lsof -nP -iTCP:"${SURGE_SOCKS_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
 }
 
 ensure_tun_stopped_if_running() {
@@ -1054,10 +1151,10 @@ wait_stack_tun_ready() {
 
     ip="$(probe_public_ip_direct_fast || true)"
     if [ -n "$ip" ]; then
-      if [ -n "${IPROYAL_HOST:-}" ] && [ "$ip" != "$IPROYAL_HOST" ]; then
+      if [ -n "${UPSTREAM_PROXY_HOST:-}" ] && [ "$ip" != "$UPSTREAM_PROXY_HOST" ]; then
         mismatch_count=$((mismatch_count + 1))
         echo "stack_tun_ip_mismatch=$ip"
-        echo "stack_tun_expected_ip=$IPROYAL_HOST"
+        echo "stack_tun_expected_ip=$UPSTREAM_PROXY_HOST"
         if [ "$mismatch_count" -ge 3 ]; then
           return 1
         fi
@@ -1091,10 +1188,10 @@ wait_stack_tun_post_cutover_ready() {
 
     ip="$(probe_public_ip_direct_fast || true)"
     if [ -n "$ip" ]; then
-      if [ -n "${IPROYAL_HOST:-}" ] && [ "$ip" != "$IPROYAL_HOST" ]; then
+      if [ -n "${UPSTREAM_PROXY_HOST:-}" ] && [ "$ip" != "$UPSTREAM_PROXY_HOST" ]; then
         mismatch_count=$((mismatch_count + 1))
         echo "stack_tun_postcheck_mismatch=$ip"
-        echo "stack_tun_expected_ip=$IPROYAL_HOST"
+        echo "stack_tun_expected_ip=$UPSTREAM_PROXY_HOST"
         if [ "$mismatch_count" -ge 2 ]; then
           return 1
         fi
@@ -1119,6 +1216,7 @@ wait_stack_tun_post_cutover_ready() {
 rollback_to_stack_proxy() {
   tun_stop >/dev/null 2>&1 || true
   start_tunnel_service >/dev/null 2>&1 || true
+  set_proxy_core_upstream_mode relay >/dev/null 2>&1 || true
   start_proxy_core_service >/dev/null 2>&1 || true
   wait_proxy_core_ready || true
   proxy_off_all >/dev/null 2>&1 || true
@@ -1134,7 +1232,9 @@ use_stack_proxy() {
   fi
 
   ensure_tun_stopped_if_running
-  start_services
+  start_tunnel_service
+  set_proxy_core_upstream_mode relay
+  start_proxy_core_service >/dev/null 2>&1 || true
   proxy_off_all >/dev/null 2>&1 || true
   proxy_on "$@"
 
@@ -1166,6 +1266,7 @@ use_stack_tun() {
   local attempted_without_proxy_core="no"
 
   start_tunnel_service
+  set_proxy_core_upstream_mode relay >/dev/null 2>&1 || true
 
   if [ "$(proxy_core_running_value)" = "yes" ]; then
     restore_proxy_core="yes"
@@ -1260,12 +1361,16 @@ use_surge() {
   proxy_off_all
   shell_off
   ensure_tun_stopped_if_running
-  start_tunnel_service
-  start_proxy_core_service >/dev/null 2>&1 || true
 
   if [ "${START_SURGE_WHEN_OFF:-1}" = "1" ]; then
     start_surge
+    wait_surge_proxy_ready || true
   fi
+
+  stop_tunnel_service
+  set_proxy_core_upstream_mode surge
+  start_proxy_core_service >/dev/null 2>&1 || true
+  wait_proxy_core_ready || true
 
   echo "mode=surge"
 }
@@ -1278,12 +1383,15 @@ use_direct() {
   proxy_off_all
   shell_off
   ensure_tun_stopped_if_running
-  start_tunnel_service
-  start_proxy_core_service >/dev/null 2>&1 || true
 
   if [ "${STOP_SURGE_WHEN_DIRECT:-1}" = "1" ]; then
     stop_surge
   fi
+
+  stop_tunnel_service
+  set_proxy_core_upstream_mode direct
+  start_proxy_core_service >/dev/null 2>&1 || true
+  wait_proxy_core_ready || true
 
   echo "mode=direct"
 }

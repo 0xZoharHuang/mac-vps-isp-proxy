@@ -7,8 +7,11 @@ ENV_FILE="${DMIT_IPROYAL_ENV_FILE:-$HOME/.config/dmit-iproyal/env}"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
+UPSTREAM_PROXY_HOST="${UPSTREAM_PROXY_HOST:-${IPROYAL_HOST:-}}"
+UPSTREAM_PROXY_PORT="${UPSTREAM_PROXY_PORT:-${IPROYAL_PORT:-}}"
+
 exec /usr/bin/ssh -N \
-  -L "127.0.0.1:${FORWARD_LOCAL_PORT}:${IPROYAL_HOST}:${IPROYAL_PORT}" \
+  -L "127.0.0.1:${FORWARD_LOCAL_PORT}:${UPSTREAM_PROXY_HOST}:${UPSTREAM_PROXY_PORT}" \
   -o ExitOnForwardFailure=yes \
   -o BatchMode=yes \
   -o ConnectTimeout=10 \
