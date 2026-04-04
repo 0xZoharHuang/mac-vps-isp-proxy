@@ -96,6 +96,7 @@ stack_proxy_precutover_attempts="${STACK_PROXY_PRECUTOVER_ATTEMPTS:-20}"
 stack_proxy_precutover_consecutive="${STACK_PROXY_PRECUTOVER_CONSECUTIVE:-3}"
 stack_proxy_postcheck_attempts="${STACK_PROXY_POSTCHECK_ATTEMPTS:-6}"
 stack_proxy_postcheck_interval="${STACK_PROXY_POSTCHECK_INTERVAL:-2}"
+keep_tunnel_warm_on_surge="${KEEP_TUNNEL_WARM_ON_SURGE:-1}"
 proxy_core_upstream_mode="${PROXY_CORE_UPSTREAM_MODE:-relay}"
 surge_proxy_wait_attempts="${SURGE_PROXY_WAIT_ATTEMPTS:-20}"
 health_monitor_interval="${HEALTH_MONITOR_INTERVAL:-30}"
@@ -148,6 +149,37 @@ ensure_runtime_dirs() {
   mkdir -p "$(dirname "$SHELL_ENV_FILE")" "$LOG_DIR" "$STATE_DIR" "$CONTROL_DIR"
   chmod 700 "$STATE_DIR" "$CONTROL_DIR" >/dev/null 2>&1 || true
 }
+
+mode_switch_lock_acquire() {
+  local waited=0 max_wait=150
+  ensure_runtime_dirs
+
+  while ! mkdir "$MODE_SWITCH_LOCK_FILE" >/dev/null 2>&1; do
+    waited=$((waited + 1))
+    if [ "$waited" -ge "$max_wait" ]; then
+      echo "Mode switch lock timeout." >&2
+      return 1
+    fi
+    sleep 0.2
+  done
+
+  printf '%s\n' "$$" >"$MODE_SWITCH_LOCK_FILE/pid" 2>/dev/null || true
+}
+
+mode_switch_lock_release() {
+  rm -f "$MODE_SWITCH_LOCK_FILE/pid" >/dev/null 2>&1 || true
+  rmdir "$MODE_SWITCH_LOCK_FILE" >/dev/null 2>&1 || true
+}
+
+mode_switch_lock_held() {
+  [ -d "$MODE_SWITCH_LOCK_FILE" ]
+}
+
+run_with_mode_switch_lock() (
+  mode_switch_lock_acquire || exit 1
+  trap 'mode_switch_lock_release' EXIT INT TERM
+  "$@"
+)
 
 utc_now() {
   date -u '+%Y-%m-%dT%H:%M:%SZ'
@@ -414,6 +446,14 @@ shell_status() {
     sed -n '1,20p' "$SHELL_ENV_FILE"
   else
     echo "shell_proxy=off"
+  fi
+}
+
+shell_proxy_enabled_value() {
+  if [ -f "$SHELL_ENV_FILE" ]; then
+    echo "yes"
+  else
+    echo "no"
   fi
 }
 
@@ -1074,6 +1114,24 @@ global_proxy_points_to_surge() {
   [ "$sp" = "$SURGE_HTTP_PORT" ] || return 1
 }
 
+shell_proxy_points_to_stack() {
+  [ "$(shell_proxy_enabled_value)" = "yes" ] || return 1
+  [ "$(proxy_core_running_value)" = "yes" ] || return 1
+  [ "${proxy_core_upstream_mode:-}" = "relay" ] || return 1
+  [ "$(tunnel_running_value)" = "yes" ] || return 1
+}
+
+wait_global_stack_proxy_enabled() {
+  local i
+  for i in $(seq 1 8); do
+    if global_proxy_points_to_stack; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
 default_interface_value() {
   route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}'
 }
@@ -1131,6 +1189,11 @@ current_mode() {
     else
       echo "mode=other-proxy"
     fi
+    return 0
+  fi
+
+  if shell_proxy_points_to_stack; then
+    echo "mode=shell-proxy"
     return 0
   fi
 
@@ -1489,6 +1552,11 @@ health_monitor_once() (
   ensure_runtime_dirs
   rotate_user_logs_if_needed
 
+  if mode_switch_lock_held; then
+    echo "health_monitor=mode-switch-active"
+    exit 0
+  fi
+
   if ! mkdir "$MONITOR_LOCK_DIR" >/dev/null 2>&1; then
     echo "health_monitor=locked"
     exit 0
@@ -1530,7 +1598,7 @@ health_monitor_once() (
 )
 
 wait_stack_proxy_relay_ready_before_cutover() {
-  local direct_before="${1:-}" i consecutive=0 snapshot http_ip socks_ip
+  local direct_before="${1:-}" i consecutive=0 snapshot http_ip socks_ip ready_reason
 
   for i in $(seq 1 "$stack_proxy_precutover_attempts"); do
     snapshot="$(stack_proxy_health_snapshot || true)"
@@ -1542,23 +1610,33 @@ wait_stack_proxy_relay_ready_before_cutover() {
 
     http_ip="$(printf '%s\n' "$snapshot" | awk -F= '/^http_ip=/{print $2; exit}')"
     socks_ip="$(printf '%s\n' "$snapshot" | awk -F= '/^socks_ip=/{print $2; exit}')"
+    ready_reason=""
 
     if [ -n "$http_ip" ] && [ "$http_ip" != "unknown" ]; then
       if [ -n "${UPSTREAM_PROXY_HOST:-}" ] && [ "$http_ip" = "$UPSTREAM_PROXY_HOST" ]; then
         consecutive=$((consecutive + 1))
+        ready_reason="http-ip-confirmed"
       elif [ -n "$direct_before" ] && [ "$http_ip" != "$direct_before" ]; then
         consecutive=$((consecutive + 1))
+        ready_reason="http-ip-changed"
       else
         consecutive=0
       fi
     elif [ -n "$socks_ip" ] && [ "$socks_ip" != "unknown" ]; then
       if [ -n "${UPSTREAM_PROXY_HOST:-}" ] && [ "$socks_ip" = "$UPSTREAM_PROXY_HOST" ]; then
         consecutive=$((consecutive + 1))
+        ready_reason="socks-ip-confirmed"
       elif [ -n "$direct_before" ] && [ "$socks_ip" != "$direct_before" ]; then
         consecutive=$((consecutive + 1))
+        ready_reason="socks-ip-changed"
       else
         consecutive=0
       fi
+    elif [ "${proxy_core_upstream_mode:-}" = "relay" ]; then
+      # If relay-mode probes complete repeatedly but public-IP endpoints do not
+      # yield a body quickly, treat the relay as warm enough to cut over.
+      consecutive=$((consecutive + 1))
+      ready_reason="healthy-unknown-ip"
     else
       consecutive=0
     fi
@@ -1570,6 +1648,7 @@ wait_stack_proxy_relay_ready_before_cutover() {
       if [ -n "$socks_ip" ] && [ "$socks_ip" != "unknown" ]; then
         echo "precutover_socks_ip=$socks_ip"
       fi
+      [ -n "$ready_reason" ] && echo "precutover_reason=$ready_reason"
       echo "precutover_consecutive=$consecutive"
       return 0
     fi
@@ -1754,6 +1833,12 @@ use_stack_proxy() {
   proxy_off_all >/dev/null 2>&1 || true
   proxy_on "$@"
 
+  if ! wait_global_stack_proxy_enabled; then
+    shell_off >/dev/null 2>&1 || true
+    handle_stack_failure "stack-proxy" "system_proxy_apply_failed" || true
+    return 1
+  fi
+
   if [ "${AUTO_SHELL_ENABLE_ON_STACK:-1}" = "1" ]; then
     shell_on
   fi
@@ -1896,7 +1981,11 @@ use_surge() {
     wait_surge_proxy_ready || true
   fi
 
-  stop_tunnel_service
+  if [ "$keep_tunnel_warm_on_surge" = "1" ]; then
+    start_tunnel_service >/dev/null 2>&1 || true
+  else
+    stop_tunnel_service
+  fi
   set_proxy_core_upstream_mode surge
   start_proxy_core_service >/dev/null 2>&1 || true
   wait_proxy_core_ready || true
@@ -2193,41 +2282,41 @@ case "$cmd" in
     ;;
   use-stack)
     shift
-    use_stack_proxy "$@"
+    run_with_mode_switch_lock use_stack_proxy "$@"
     ;;
   use-stack-proxy)
     shift
-    use_stack_proxy "$@"
+    run_with_mode_switch_lock use_stack_proxy "$@"
     ;;
   use-stack-proxy-gui)
     shift
-    use_stack_proxy_gui "$@"
+    run_with_mode_switch_lock use_stack_proxy_gui "$@"
     ;;
   use-stack-tun)
-    use_stack_tun
+    run_with_mode_switch_lock use_stack_tun
     ;;
   use-stack-tun-gui)
-    use_stack_tun_gui
+    run_with_mode_switch_lock use_stack_tun_gui
     ;;
   use-stack-auto)
     shift
-    use_stack_auto "$@"
+    run_with_mode_switch_lock use_stack_auto "$@"
     ;;
   use-stack-auto-gui)
     shift
-    use_stack_auto_gui "$@"
+    run_with_mode_switch_lock use_stack_auto_gui "$@"
     ;;
   use-surge)
-    use_surge
+    run_with_mode_switch_lock use_surge
     ;;
   use-surge-gui)
-    use_surge_gui
+    run_with_mode_switch_lock use_surge_gui
     ;;
   use-direct)
-    use_direct
+    run_with_mode_switch_lock use_direct
     ;;
   use-direct-gui)
-    use_direct_gui
+    run_with_mode_switch_lock use_direct_gui
     ;;
   tun-install)
     tun_install

@@ -71,6 +71,10 @@ case "$mode" in
     label="D-ISP PROXY"
     color="#2BA84A"
     ;;
+  shell-proxy)
+    label="D-ISP CLI"
+    color="#B7791F"
+    ;;
   surge)
     label="D-ISP SURGE"
     color="#CC7A00"
