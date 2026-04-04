@@ -13,6 +13,8 @@ SINGBOX_CONFIG_FILE="${SINGBOX_CONFIG_FILE:-$HOME/.config/dmit-iproyal/sing-box.
 SINGBOX_TUN_CONFIG_FILE="${SINGBOX_TUN_CONFIG_FILE:-$HOME/.config/dmit-iproyal/sing-box-tun.json}"
 
 LOG_DIR="$HOME/Library/Logs/dmit-iproyal"
+STATE_DIR="${DMIT_IPROYAL_STATE_DIR:-$HOME/.config/dmit-iproyal/state}"
+CONTROL_DIR="${DMIT_IPROYAL_CONTROL_DIR:-$HOME/.config/dmit-iproyal/control}"
 RUNTIME_DIR="$HOME/Library/Application Support/dmit-iproyal"
 RUNTIME_BIN="$RUNTIME_DIR/bin"
 LOCAL_BIN_DIR="$HOME/.local/bin"
@@ -21,10 +23,12 @@ LOCAL_CTL_LINK="$LOCAL_BIN_DIR/dmit-iproyal-proxyctl"
 LAUNCH_DIR="$HOME/Library/LaunchAgents"
 TUNNEL_LABEL="com.zohar.dmit.iproyal.tunnel"
 SINGBOX_LABEL="com.zohar.dmit.iproyal.singbox"
+HEALTH_MONITOR_LABEL="com.zohar.dmit.iproyal.healthmonitor"
 LEGACY_BRIDGE_LABEL="com.zohar.dmit.iproyal.bridge"
 
 TUNNEL_PLIST="$LAUNCH_DIR/${TUNNEL_LABEL}.plist"
 SINGBOX_PLIST="$LAUNCH_DIR/${SINGBOX_LABEL}.plist"
+HEALTH_MONITOR_PLIST="$LAUNCH_DIR/${HEALTH_MONITOR_LABEL}.plist"
 
 DMIT_HOST="${DMIT_HOST:-}"
 DMIT_PORT="${DMIT_PORT:-443}"
@@ -74,6 +78,17 @@ PROBE_FAST_CONNECT_TIMEOUT="${PROBE_FAST_CONNECT_TIMEOUT:-1}"
 PROBE_FAST_MAX_TIME="${PROBE_FAST_MAX_TIME:-3}"
 TUN_READY_ATTEMPTS="${TUN_READY_ATTEMPTS:-20}"
 TUN_POSTCHECK_ATTEMPTS="${TUN_POSTCHECK_ATTEMPTS:-12}"
+STACK_PROXY_PRECUTOVER_ATTEMPTS="${STACK_PROXY_PRECUTOVER_ATTEMPTS:-20}"
+STACK_PROXY_PRECUTOVER_CONSECUTIVE="${STACK_PROXY_PRECUTOVER_CONSECUTIVE:-3}"
+STACK_PROXY_POSTCHECK_ATTEMPTS="${STACK_PROXY_POSTCHECK_ATTEMPTS:-6}"
+STACK_PROXY_POSTCHECK_INTERVAL="${STACK_PROXY_POSTCHECK_INTERVAL:-2}"
+HEALTH_MONITOR_INTERVAL="${HEALTH_MONITOR_INTERVAL:-30}"
+HEALTH_FAILURE_THRESHOLD="${HEALTH_FAILURE_THRESHOLD:-3}"
+AUTO_FALLBACK_TO_SURGE="${AUTO_FALLBACK_TO_SURGE:-1}"
+LAUNCHD_SOFT_MAXFILES="${LAUNCHD_SOFT_MAXFILES:-65536}"
+LAUNCHD_HARD_MAXFILES="${LAUNCHD_HARD_MAXFILES:-131072}"
+LOG_ROTATE_MAX_BYTES="${LOG_ROTATE_MAX_BYTES:-10485760}"
+LOG_ROTATE_KEEP="${LOG_ROTATE_KEEP:-5}"
 
 AUTO_ENABLE_PROXY="${AUTO_ENABLE_PROXY:-0}"
 
@@ -91,7 +106,33 @@ require_env DMIT_HOST
 require_env UPSTREAM_PROXY_HOST
 require_env UPSTREAM_PROXY_PORT
 
-mkdir -p "$HOME/.ssh" "$(dirname "$ENV_FILE")" "$LOG_DIR" "$RUNTIME_BIN" "$LAUNCH_DIR" "$LOCAL_BIN_DIR"
+mkdir -p "$HOME/.ssh" "$(dirname "$ENV_FILE")" "$LOG_DIR" "$STATE_DIR" "$CONTROL_DIR" "$RUNTIME_BIN" "$LAUNCH_DIR" "$LOCAL_BIN_DIR"
+chmod 700 "$STATE_DIR" "$CONTROL_DIR" >/dev/null 2>&1 || true
+
+rotate_log_file_if_needed() {
+  local file="$1" size i prev
+
+  [ -f "$file" ] || return 0
+  size="$(stat -f %z "$file" 2>/dev/null || echo 0)"
+  [ "$size" -ge "$LOG_ROTATE_MAX_BYTES" ] || return 0
+
+  for ((i=LOG_ROTATE_KEEP; i>=2; i--)); do
+    prev=$((i - 1))
+    [ -f "${file}.${prev}" ] && mv -f "${file}.${prev}" "${file}.${i}"
+  done
+
+  cp "$file" "${file}.1" 2>/dev/null || cat "$file" >"${file}.1"
+  : >"$file"
+}
+
+rotate_user_logs_if_needed() {
+  rotate_log_file_if_needed "$LOG_DIR/tunnel.log"
+  rotate_log_file_if_needed "$LOG_DIR/tunnel.err.log"
+  rotate_log_file_if_needed "$LOG_DIR/singbox.log"
+  rotate_log_file_if_needed "$LOG_DIR/singbox.err.log"
+  rotate_log_file_if_needed "$LOG_DIR/health-monitor.log"
+  rotate_log_file_if_needed "$LOG_DIR/health-monitor.err.log"
+}
 
 ensure_singbox() {
   if command -v sing-box >/dev/null 2>&1; then
@@ -186,6 +227,19 @@ PROBE_FAST_CONNECT_TIMEOUT=$PROBE_FAST_CONNECT_TIMEOUT
 PROBE_FAST_MAX_TIME=$PROBE_FAST_MAX_TIME
 TUN_READY_ATTEMPTS=$TUN_READY_ATTEMPTS
 TUN_POSTCHECK_ATTEMPTS=$TUN_POSTCHECK_ATTEMPTS
+STACK_PROXY_PRECUTOVER_ATTEMPTS=$STACK_PROXY_PRECUTOVER_ATTEMPTS
+STACK_PROXY_PRECUTOVER_CONSECUTIVE=$STACK_PROXY_PRECUTOVER_CONSECUTIVE
+STACK_PROXY_POSTCHECK_ATTEMPTS=$STACK_PROXY_POSTCHECK_ATTEMPTS
+STACK_PROXY_POSTCHECK_INTERVAL=$STACK_PROXY_POSTCHECK_INTERVAL
+HEALTH_MONITOR_INTERVAL=$HEALTH_MONITOR_INTERVAL
+HEALTH_FAILURE_THRESHOLD=$HEALTH_FAILURE_THRESHOLD
+AUTO_FALLBACK_TO_SURGE=$AUTO_FALLBACK_TO_SURGE
+LAUNCHD_SOFT_MAXFILES=$LAUNCHD_SOFT_MAXFILES
+LAUNCHD_HARD_MAXFILES=$LAUNCHD_HARD_MAXFILES
+LOG_ROTATE_MAX_BYTES=$LOG_ROTATE_MAX_BYTES
+LOG_ROTATE_KEEP=$LOG_ROTATE_KEEP
+DMIT_IPROYAL_STATE_DIR=$STATE_DIR
+DMIT_IPROYAL_CONTROL_DIR=$CONTROL_DIR
 EOF_ENV
 chmod 600 "$ENV_FILE"
 echo "Wrote runtime env: $ENV_FILE"
@@ -208,6 +262,8 @@ DMIT_IPROYAL_ENV_FILE="$ENV_FILE" "$RUNTIME_BIN/generate_singbox_tun_config.sh"
 "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG_FILE" >/dev/null
 "$SINGBOX_BIN" check -c "$SINGBOX_TUN_CONFIG_FILE" >/dev/null
 
+rotate_user_logs_if_needed
+
 cat >"$TUNNEL_PLIST" <<EOF_TUNNEL
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -226,6 +282,16 @@ cat >"$TUNNEL_PLIST" <<EOF_TUNNEL
   <true/>
   <key>ProcessType</key>
   <string>Background</string>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>$LAUNCHD_SOFT_MAXFILES</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>$LAUNCHD_HARD_MAXFILES</integer>
+  </dict>
   <key>StandardOutPath</key>
   <string>$LOG_DIR/tunnel.log</string>
   <key>StandardErrorPath</key>
@@ -257,6 +323,16 @@ cat >"$SINGBOX_PLIST" <<EOF_SINGBOX
   <true/>
   <key>ProcessType</key>
   <string>Background</string>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>$LAUNCHD_SOFT_MAXFILES</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>$LAUNCHD_HARD_MAXFILES</integer>
+  </dict>
   <key>StandardOutPath</key>
   <string>$LOG_DIR/singbox.log</string>
   <key>StandardErrorPath</key>
@@ -270,18 +346,61 @@ cat >"$SINGBOX_PLIST" <<EOF_SINGBOX
 </plist>
 EOF_SINGBOX
 
-chmod 644 "$TUNNEL_PLIST" "$SINGBOX_PLIST"
+cat >"$HEALTH_MONITOR_PLIST" <<EOF_HEALTH
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$HEALTH_MONITOR_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$RUNTIME_BIN/dmit_iproyal_proxyctl.sh</string>
+    <string>health-monitor-once</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>$HEALTH_MONITOR_INTERVAL</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>$LOG_DIR/health-monitor.log</string>
+  <key>StandardErrorPath</key>
+  <string>$LOG_DIR/health-monitor.err.log</string>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>$LAUNCHD_SOFT_MAXFILES</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>$LAUNCHD_HARD_MAXFILES</integer>
+  </dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DMIT_IPROYAL_ENV_FILE</key>
+    <string>$ENV_FILE</string>
+  </dict>
+</dict>
+</plist>
+EOF_HEALTH
+
+chmod 644 "$TUNNEL_PLIST" "$SINGBOX_PLIST" "$HEALTH_MONITOR_PLIST"
 echo "Wrote launchd agents in $LAUNCH_DIR"
 
 /bin/launchctl bootout "gui/$UID/$LEGACY_BRIDGE_LABEL" >/dev/null 2>&1 || true
 
-for plist in "$TUNNEL_PLIST" "$SINGBOX_PLIST"; do
+for plist in "$TUNNEL_PLIST" "$SINGBOX_PLIST" "$HEALTH_MONITOR_PLIST"; do
   /bin/launchctl bootout "gui/$UID" "$plist" >/dev/null 2>&1 || true
   /bin/launchctl bootstrap "gui/$UID" "$plist"
 done
 
 /bin/launchctl kickstart -k "gui/$UID/$TUNNEL_LABEL"
 /bin/launchctl kickstart -k "gui/$UID/$SINGBOX_LABEL"
+/bin/launchctl kickstart -k "gui/$UID/$HEALTH_MONITOR_LABEL" >/dev/null 2>&1 || true
 
 echo "Services started."
 echo "Local HTTP proxy: ${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}"

@@ -22,6 +22,10 @@ tun_running=""
 surge_running=""
 proxy_core_running=""
 tunnel_running=""
+health_monitor_loaded=""
+health_degraded=""
+auto_fallback=""
+last_failure_reason=""
 
 while IFS='=' read -r k v; do
   case "$k" in
@@ -34,6 +38,10 @@ while IFS='=' read -r k v; do
     surge_running) surge_running="$v" ;;
     proxy_core_running) proxy_core_running="$v" ;;
     tunnel_running) tunnel_running="$v" ;;
+    health_monitor_loaded) health_monitor_loaded="$v" ;;
+    health_degraded) health_degraded="$v" ;;
+    auto_fallback) auto_fallback="$v" ;;
+    last_failure_reason) last_failure_reason="$v" ;;
   esac
 done < <("$CTL" info 2>/dev/null || true)
 
@@ -46,6 +54,10 @@ done < <("$CTL" info 2>/dev/null || true)
 [ -n "$surge_running" ] || surge_running="unknown"
 [ -n "$proxy_core_running" ] || proxy_core_running="unknown"
 [ -n "$tunnel_running" ] || tunnel_running="unknown"
+[ -n "$health_monitor_loaded" ] || health_monitor_loaded="unknown"
+[ -n "$health_degraded" ] || health_degraded="unknown"
+[ -n "$auto_fallback" ] || auto_fallback="unknown"
+[ -n "$last_failure_reason" ] || last_failure_reason="none"
 
 label="D-ISP ?"
 color="#E53E3E"
@@ -77,6 +89,14 @@ case "$mode" in
     ;;
 esac
 
+if [ "$auto_fallback" = "yes" ]; then
+  label="D-ISP SURGE!"
+  color="#C2410C"
+elif [ "$health_degraded" = "yes" ]; then
+  label="${label}!"
+  color="#DD6B20"
+fi
+
 # No top-bar click action: click only opens dropdown menu.
 echo "$label | color=$color"
 
@@ -100,6 +120,10 @@ echo "--TUN Running: $tun_running"
 echo "--Surge Running: $surge_running"
 echo "--Proxy Core Running: $proxy_core_running"
 echo "--Tunnel Running: $tunnel_running"
+echo "--Health Monitor: $health_monitor_loaded"
+echo "--Degraded: $health_degraded"
+echo "--Auto Fallback: $auto_fallback"
+echo "--Last Failure: $last_failure_reason"
 echo "--Refresh Status | refresh=true"
 echo "--Quick Test Exit IP | bash=$CTL param1=test terminal=false refresh=true"
 echo "--Doctor | bash=$CTL param1=doctor terminal=false refresh=true"

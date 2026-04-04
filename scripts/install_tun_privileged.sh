@@ -27,6 +27,15 @@ ROOT_LABEL="com.zohar.dmit.iproyal.singbox.tun"
 
 USER_TUN_CONFIG_FILE="${SINGBOX_TUN_CONFIG_FILE:-$HOME/.config/dmit-iproyal/sing-box-tun.json}"
 SINGBOX_BIN="${SINGBOX_BIN:-$(command -v sing-box || true)}"
+TUN_CONTROL_DIR="${DMIT_IPROYAL_CONTROL_DIR:-$HOME/.config/dmit-iproyal/control}"
+TUN_DISABLE_FILE="$TUN_CONTROL_DIR/tun.disabled"
+TUN_PID_FILE="$TUN_CONTROL_DIR/tun.pid"
+TUN_STATUS_FILE="$TUN_CONTROL_DIR/tun.status"
+LAUNCHD_SOFT_MAXFILES="${LAUNCHD_SOFT_MAXFILES:-65536}"
+LAUNCHD_HARD_MAXFILES="${LAUNCHD_HARD_MAXFILES:-131072}"
+
+mkdir -p "$TUN_CONTROL_DIR"
+chmod 700 "$TUN_CONTROL_DIR" >/dev/null 2>&1 || true
 
 [ -n "$SINGBOX_BIN" ] || {
   echo "sing-box not found in PATH. Run setup first." >&2
@@ -63,6 +72,12 @@ trap cleanup EXIT
 cat >"$TMP_ROOT_ENV" <<EOF_ENV
 SINGBOX_BIN=$SINGBOX_BIN
 SINGBOX_TUN_CONFIG_FILE=$ROOT_TUN_CONFIG_FILE
+TUN_CONTROL_DIR=$TUN_CONTROL_DIR
+TUN_DISABLE_FILE=$TUN_DISABLE_FILE
+TUN_PID_FILE=$TUN_PID_FILE
+TUN_STATUS_FILE=$TUN_STATUS_FILE
+LAUNCHD_SOFT_MAXFILES=$LAUNCHD_SOFT_MAXFILES
+LAUNCHD_HARD_MAXFILES=$LAUNCHD_HARD_MAXFILES
 EOF_ENV
 chmod 600 "$TMP_ROOT_ENV"
 
@@ -92,6 +107,16 @@ cat >"$ROOT_PLIST" <<PLIST
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>$LAUNCHD_SOFT_MAXFILES</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>$LAUNCHD_HARD_MAXFILES</integer>
+  </dict>
   <key>StandardOutPath</key>
   <string>$ROOT_LOG_DIR/singbox-tun.log</string>
   <key>StandardErrorPath</key>
