@@ -25,8 +25,9 @@ exec /usr/bin/ssh -N \
   -o ExitOnForwardFailure=yes \
   -o BatchMode=yes \
   -o ConnectTimeout=10 \
-  -o ServerAliveInterval=15 \
-  -o ServerAliveCountMax=2 \
+  -o ConnectionAttempts=3 \
+  -o ServerAliveInterval=10 \
+  -o ServerAliveCountMax=1 \
   -o TCPKeepAlive=yes \
   -o LogLevel=ERROR \
   -o StrictHostKeyChecking=accept-new \

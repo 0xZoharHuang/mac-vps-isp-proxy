@@ -11,6 +11,10 @@ A macOS proxy stack that routes traffic through `local -> DMIT VPS (SSH relay) -
   - `SURGE` (handoff back to Surge)
   - `OFF` (direct)
 - Built-in diagnostics (`doctor`, `test`, TUN status/repair commands).
+- Built-in routing-scope verification for:
+  - system proxy traffic
+  - new terminals (shell env injection)
+  - old terminals still pinned to local `127.0.0.1:17890/17891`
 
 ## Important Notes
 
@@ -91,6 +95,9 @@ cd data-series/dmit-iproyal-stack
 ```bash
 dmit-iproyal-proxyctl info
 dmit-iproyal-proxyctl doctor
+dmit-iproyal-proxyctl verify-scope
+dmit-iproyal-proxyctl verify-cli-apis
+dmit-iproyal-proxyctl session-sync
 
 dmit-iproyal-proxyctl use-stack-proxy-gui
 dmit-iproyal-proxyctl use-stack-tun-gui
@@ -109,10 +116,37 @@ dmit-iproyal-proxyctl tun-repair-gui
 - `TUN_KEEP_PROXY_CORE=1`
 - `TUN_KEEP_SHELL_ENV=1`
 - Fast health probes + post-cutover validation + rollback to proxy mode
+- Persistent health monitor loop with stack-proxy self-repair before fallback
+
+## Scope Verification
+
+`verify-scope` validates the active mode against three practical surfaces:
+
+- `system_proxy`: whether macOS network services point to the expected proxy target
+- `new_terminal`: whether a freshly opened shell will inherit the intended local proxy env
+- `legacy_terminal`: whether already-open terminals/apps still pointing at local `127.0.0.1:17890/17891` can reach the expected upstream path
+
+In `stack-proxy`, the verifier also compares the local HTTP/SOCKS egress against the relay path so you can confirm traffic is actually leaving through `local -> DMIT VPS -> ISP proxy`.
+
+`verify-cli-apis` checks non-interactively whether the current relay/local/system paths can reach the official OpenAI and Anthropic API endpoints. Expected healthy unauthenticated responses are typically `401` or `405`, not `000`.
+
+`session-sync` is the one-shot repair command for an already-open shell. It applies the current shell state immediately, and in `zsh` it also attaches an auto-sync hook so future mode switches are picked up on the next prompt:
+
+- `stack-proxy` / `shell-proxy`: emit `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`
+- `surge` / `direct`: emit `unset ..._PROXY`
+
+Example:
+
+```bash
+eval "$(dmit-iproyal-proxyctl session-sync)"
+```
+
+After this one-time attach, an interactive `zsh` session will re-read `~/.config/dmit-iproyal/shell_proxy.env` on each prompt, so menu-bar mode changes no longer require reopening the terminal.
 
 ## Troubleshooting
 
 - `SOCKS proxy invalid response`: check upstream proxy protocol/account and relay path.
+- `stack-proxy` suddenly loses connectivity: the health monitor now tries `relay + sing-box` repair first, then falls back to `surge` if the relay cannot be recovered.
 - `stream disconnected` in CLI after switching: use current codebase defaults (`TUN_KEEP_PROXY_CORE=1`, `TUN_KEEP_SHELL_ENV=1`).
 - Existing terminal still points at old local proxy after switching: current code keeps local proxy ports alive and rewires them to `surge` or `direct` to avoid long hangs; if a command is already blocked, interrupt once and rerun.
 - `403 forbidden`: replace egress IP/provider; this is typically reputation-based.

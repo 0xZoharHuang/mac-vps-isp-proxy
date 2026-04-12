@@ -32,6 +32,7 @@ MODE_SWITCH_LOCK_FILE="$STATE_DIR/mode-switch.lock"
 TUN_DISABLE_FILE="$CONTROL_DIR/tun.disabled"
 TUN_STATUS_FILE="$CONTROL_DIR/tun.status"
 TUN_PID_FILE="$CONTROL_DIR/tun.pid"
+MANAGED_SERVICES_FILE="$CONTROL_DIR/managed_services.list"
 SURGE_CLI="/Applications/Surge.app/Contents/Applications/surge-cli"
 SURGE_BIN_MATCH="/Applications/Surge.app/Contents/MacOS/Surge"
 SURGE_HTTP_HOST="${SURGE_HTTP_HOST:-127.0.0.1}"
@@ -93,14 +94,14 @@ probe_fast_max_time="${PROBE_FAST_MAX_TIME:-3}"
 tun_ready_attempts="${TUN_READY_ATTEMPTS:-20}"
 tun_postcheck_attempts="${TUN_POSTCHECK_ATTEMPTS:-12}"
 stack_proxy_precutover_attempts="${STACK_PROXY_PRECUTOVER_ATTEMPTS:-20}"
-stack_proxy_precutover_consecutive="${STACK_PROXY_PRECUTOVER_CONSECUTIVE:-3}"
+stack_proxy_precutover_consecutive="${STACK_PROXY_PRECUTOVER_CONSECUTIVE:-5}"
 stack_proxy_postcheck_attempts="${STACK_PROXY_POSTCHECK_ATTEMPTS:-6}"
 stack_proxy_postcheck_interval="${STACK_PROXY_POSTCHECK_INTERVAL:-2}"
 keep_tunnel_warm_on_surge="${KEEP_TUNNEL_WARM_ON_SURGE:-1}"
 proxy_core_upstream_mode="${PROXY_CORE_UPSTREAM_MODE:-relay}"
 surge_proxy_wait_attempts="${SURGE_PROXY_WAIT_ATTEMPTS:-20}"
-health_monitor_interval="${HEALTH_MONITOR_INTERVAL:-30}"
-health_failure_threshold="${HEALTH_FAILURE_THRESHOLD:-3}"
+health_monitor_interval="${HEALTH_MONITOR_INTERVAL:-10}"
+health_failure_threshold="${HEALTH_FAILURE_THRESHOLD:-2}"
 auto_fallback_to_surge="${AUTO_FALLBACK_TO_SURGE:-1}"
 launchd_soft_maxfiles="${LAUNCHD_SOFT_MAXFILES:-65536}"
 launchd_hard_maxfiles="${LAUNCHD_HARD_MAXFILES:-131072}"
@@ -319,6 +320,41 @@ tun_disabled_requested() {
   [ -f "$TUN_DISABLE_FILE" ]
 }
 
+managed_services_save() {
+  ensure_runtime_dirs
+  if [ "$#" -eq 0 ]; then
+    rm -f "$MANAGED_SERVICES_FILE"
+    return 0
+  fi
+
+  printf '%s\n' "$@" >"$MANAGED_SERVICES_FILE"
+  chmod 600 "$MANAGED_SERVICES_FILE" >/dev/null 2>&1 || true
+}
+
+managed_services_clear() {
+  rm -f "$MANAGED_SERVICES_FILE"
+}
+
+managed_services_joined_value() {
+  [ -f "$MANAGED_SERVICES_FILE" ] || return 1
+
+  awk '
+    BEGIN { first=1 }
+    NF {
+      if (!first) {
+        printf ", "
+      }
+      printf "%s", $0
+      first=0
+    }
+    END {
+      if (!first) {
+        printf "\n"
+      }
+    }
+  ' "$MANAGED_SERVICES_FILE"
+}
+
 tun_status_field() {
   local key="$1"
   [ -f "$TUN_STATUS_FILE" ] || return 1
@@ -353,10 +389,29 @@ ensure_shell_hook() {
   cat >>"$ZSHRC_FILE" <<EOF_HOOK
 
 # >>> dmit-iproyal proxy >>>
-if [ -f "$SHELL_ENV_FILE" ]; then
-  # shellcheck disable=SC1090
-  source "$SHELL_ENV_FILE"
+_dmit_iproyal_apply_shell_state() {
+  local env_file="\${DMIT_IPROYAL_SHELL_ENV_FILE:-$SHELL_ENV_FILE}"
+  if [ -r "\$env_file" ]; then
+    # shellcheck disable=SC1090
+    source "\$env_file"
+  else
+    unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy
+  fi
+}
+
+if [ -n "\${ZSH_VERSION:-}" ]; then
+  case "\$-" in
+    *i*)
+      case " \${precmd_functions[*]:-} " in
+        *" _dmit_iproyal_apply_shell_state "*) ;;
+        *)
+          precmd_functions+=(_dmit_iproyal_apply_shell_state)
+          ;;
+      esac
+      ;;
+  esac
 fi
+_dmit_iproyal_apply_shell_state
 # <<< dmit-iproyal proxy <<<
 EOF_HOOK
 
@@ -423,38 +478,97 @@ export no_proxy="\${NO_PROXY}"
 EOF_EXPORT
 }
 
+shell_reset_block() {
+  cat <<'EOF_RESET'
+unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy
+EOF_RESET
+}
+
+shell_file_mode_value() {
+  if [ ! -f "$SHELL_ENV_FILE" ]; then
+    echo "missing"
+    return 0
+  fi
+
+  awk -F': ' '/^# dmit-iproyal shell mode: /{print $2; exit}' "$SHELL_ENV_FILE"
+}
+
+render_shell_env_file() {
+  local mode="${1:-off}"
+
+  cat <<EOF_ENV
+# dmit-iproyal shell mode: $mode
+EOF_ENV
+
+  case "$mode" in
+    proxy)
+      shell_export_block
+      ;;
+    off)
+      shell_reset_block
+      ;;
+    *)
+      echo "Unsupported shell file mode: $mode" >&2
+      return 1
+      ;;
+  esac
+}
+
+write_shell_env_file() {
+  local mode="${1:-off}"
+  mkdir -p "$(dirname "$SHELL_ENV_FILE")"
+  render_shell_env_file "$mode" >"$SHELL_ENV_FILE"
+  chmod 600 "$SHELL_ENV_FILE"
+}
+
 shell_on() {
 
   ensure_shell_hook
-  shell_export_block >"$SHELL_ENV_FILE"
-  chmod 600 "$SHELL_ENV_FILE"
+  write_shell_env_file proxy
   echo "Shell proxy enabled: $SHELL_ENV_FILE"
-  echo "New terminals proxy env generated for CLI_PROXY_MODE=$cli_proxy_mode"
+  echo "New terminals and hooked zsh prompts will use CLI_PROXY_MODE=$cli_proxy_mode"
   echo "HTTP entry: $(shell_http_proxy_url)"
   echo "SOCKS entry: $(shell_socks_proxy_url)"
 }
 
 shell_off() {
-  rm -f "$SHELL_ENV_FILE"
-  echo "Shell proxy disabled for new terminals."
-  echo "Current terminal can run: unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy NO_PROXY no_proxy"
+  ensure_shell_hook
+  write_shell_env_file off
+  echo "Shell proxy disabled in state file: $SHELL_ENV_FILE"
+  echo "New terminals and hooked zsh prompts will unset proxy vars."
+  echo "Current terminal can run: eval \"\$($0 session-sync)\""
 }
 
 shell_status() {
   if [ -f "$SHELL_ENV_FILE" ]; then
-    echo "shell_proxy=on ($SHELL_ENV_FILE)"
-    sed -n '1,20p' "$SHELL_ENV_FILE"
+    case "$(shell_file_mode_value)" in
+      proxy)
+        echo "shell_proxy=on ($SHELL_ENV_FILE)"
+        ;;
+      off)
+        echo "shell_proxy=off ($SHELL_ENV_FILE)"
+        ;;
+      *)
+        echo "shell_proxy=unknown ($SHELL_ENV_FILE)"
+        ;;
+    esac
+    sed -n '1,24p' "$SHELL_ENV_FILE"
   else
     echo "shell_proxy=off"
   fi
 }
 
 shell_proxy_enabled_value() {
-  if [ -f "$SHELL_ENV_FILE" ]; then
+  if [ "$(shell_file_mode_value)" = "proxy" ]; then
     echo "yes"
   else
     echo "no"
   fi
+}
+
+shell_env_matches_current() {
+  [ -f "$SHELL_ENV_FILE" ] || return 1
+  cmp -s <(render_shell_env_file proxy) "$SHELL_ENV_FILE"
 }
 
 shell_print_exports() {
@@ -526,7 +640,7 @@ set_proxy_core_upstream_mode() {
 
 is_excluded_service() {
   case "$1" in
-    Tailscale|Thunderbolt\ Bridge|iPhone\ USB)
+    Tailscale|Thunderbolt\ Bridge|iPhone\ USB|Surge)
       return 0
       ;;
     *)
@@ -579,16 +693,16 @@ active_primary_service() {
 default_services() {
   local global_svc primary
 
-  if global_svc="$(active_global_service)"; then
-    if ! is_excluded_service "$global_svc"; then
-      echo "$global_svc"
+  if primary="$(active_primary_service)"; then
+    if ! is_excluded_service "$primary"; then
+      echo "$primary"
       return 0
     fi
   fi
 
-  if primary="$(active_primary_service)"; then
-    if ! is_excluded_service "$primary"; then
-      echo "$primary"
+  if global_svc="$(active_global_service)"; then
+    if ! is_excluded_service "$global_svc"; then
+      echo "$global_svc"
       return 0
     fi
   fi
@@ -609,6 +723,41 @@ all_eligible_services() {
       echo "$svc"
     fi
   done
+}
+
+preferred_active_service() {
+  local primary global_svc
+
+  if primary="$(active_primary_service)"; then
+    if ! is_excluded_service "$primary"; then
+      echo "$primary"
+      return 0
+    fi
+  fi
+
+  if global_svc="$(active_global_service)"; then
+    if ! is_excluded_service "$global_svc"; then
+      echo "$global_svc"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+wait_preferred_active_service_ready() {
+  local i svc
+
+  for i in $(seq 1 20); do
+    svc="$(preferred_active_service || true)"
+    if [ -n "$svc" ]; then
+      echo "$svc"
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  return 1
 }
 
 resolve_services() {
@@ -645,6 +794,14 @@ start_tunnel_service() {
     return 0
   fi
   /bin/launchctl kickstart -k "gui/$UID/$TUNNEL_LABEL"
+  wait_tunnel_listener_ready
+}
+
+restart_tunnel_service() {
+  rotate_user_logs_if_needed
+  ensure_launch_agent_loaded "$TUNNEL_LABEL" "$TUNNEL_PLIST"
+  /bin/launchctl kickstart -k "gui/$UID/$TUNNEL_LABEL"
+  wait_tunnel_listener_ready
 }
 
 start_proxy_core_service() {
@@ -654,6 +811,13 @@ start_proxy_core_service() {
     return 0
   fi
   /bin/launchctl kickstart -k "gui/$UID/$SINGBOX_LABEL"
+}
+
+restart_proxy_core_service() {
+  rotate_user_logs_if_needed
+  ensure_launch_agent_loaded "$SINGBOX_LABEL" "$SINGBOX_PLIST"
+  /bin/launchctl kickstart -k "gui/$UID/$SINGBOX_LABEL" >/dev/null 2>&1 || true
+  wait_proxy_core_ready
 }
 
 start_health_monitor_service() {
@@ -709,6 +873,17 @@ wait_proxy_core_ready() {
   local i
   for i in $(seq 1 12); do
     if [ "$(proxy_core_running_value)" = "yes" ]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+wait_tunnel_listener_ready() {
+  local i
+  for i in $(seq 1 20); do
+    if [ "$(tunnel_running_value)" = "yes" ]; then
       return 0
     fi
     sleep 0.25
@@ -976,6 +1151,39 @@ proxy_on() {
     networksetup -setsocksfirewallproxystate "$svc" on || true
     networksetup -setproxybypassdomains "$svc" "${bypass[@]}" || true
   done
+
+  managed_services_save "${svcs[@]}"
+}
+
+proxy_on_surge() {
+  local svcs=() svc
+  while IFS= read -r svc; do
+    [ -n "$svc" ] && svcs+=("$svc")
+  done < <(resolve_services "$@")
+
+  if [ "${#svcs[@]}" -eq 0 ]; then
+    echo "No eligible network services found."
+    return 1
+  fi
+
+  local bypass=()
+  while IFS= read -r svc; do
+    [ -n "$svc" ] && bypass+=("$svc")
+  done < <(build_bypass_array)
+
+  for svc in "${svcs[@]}"; do
+    echo "Enable Surge proxy on: $svc"
+    networksetup -setautoproxystate "$svc" off || true
+    networksetup -setwebproxy "$svc" "$SURGE_HTTP_HOST" "$SURGE_HTTP_PORT" off || true
+    networksetup -setwebproxystate "$svc" on || true
+    networksetup -setsecurewebproxy "$svc" "$SURGE_HTTP_HOST" "$SURGE_HTTP_PORT" off || true
+    networksetup -setsecurewebproxystate "$svc" on || true
+    networksetup -setsocksfirewallproxy "$svc" "$SURGE_SOCKS_HOST" "$SURGE_SOCKS_PORT" off || true
+    networksetup -setsocksfirewallproxystate "$svc" on || true
+    networksetup -setproxybypassdomains "$svc" "${bypass[@]}" || true
+  done
+
+  managed_services_save "${svcs[@]}"
 }
 
 proxy_off() {
@@ -995,6 +1203,8 @@ proxy_off() {
     networksetup -setsecurewebproxystate "$svc" off || true
     networksetup -setsocksfirewallproxystate "$svc" off || true
   done
+
+  managed_services_refresh_from_system_proxy
 }
 
 proxy_off_all() {
@@ -1014,6 +1224,8 @@ proxy_off_all() {
     networksetup -setsecurewebproxystate "$svc" off || true
     networksetup -setsocksfirewallproxystate "$svc" off || true
   done
+
+  managed_services_refresh_from_system_proxy
 }
 
 service_proxy_points_to_stack() {
@@ -1041,6 +1253,33 @@ service_proxy_points_to_stack() {
   [ "$socks_enabled" = "Yes" ] || return 1
   [ "$socks_server" = "$LOCAL_SOCKS_HOST" ] || return 1
   [ "$socks_port" = "$LOCAL_SOCKS_PORT" ] || return 1
+}
+
+service_proxy_points_to_surge() {
+  local svc="$1"
+  local web_enabled web_server web_port https_enabled https_server https_port socks_enabled socks_server socks_port
+
+  web_enabled="$(networksetup -getwebproxy "$svc" 2>/dev/null | awk -F': ' '/Enabled:/{print $2; exit}' | tr -d ' ')"
+  web_server="$(networksetup -getwebproxy "$svc" 2>/dev/null | awk -F': ' '/Server:/{print $2; exit}')"
+  web_port="$(networksetup -getwebproxy "$svc" 2>/dev/null | awk -F': ' '/Port:/{print $2; exit}')"
+
+  https_enabled="$(networksetup -getsecurewebproxy "$svc" 2>/dev/null | awk -F': ' '/Enabled:/{print $2; exit}' | tr -d ' ')"
+  https_server="$(networksetup -getsecurewebproxy "$svc" 2>/dev/null | awk -F': ' '/Server:/{print $2; exit}')"
+  https_port="$(networksetup -getsecurewebproxy "$svc" 2>/dev/null | awk -F': ' '/Port:/{print $2; exit}')"
+
+  socks_enabled="$(networksetup -getsocksfirewallproxy "$svc" 2>/dev/null | awk -F': ' '/Enabled:/{print $2; exit}' | tr -d ' ')"
+  socks_server="$(networksetup -getsocksfirewallproxy "$svc" 2>/dev/null | awk -F': ' '/Server:/{print $2; exit}')"
+  socks_port="$(networksetup -getsocksfirewallproxy "$svc" 2>/dev/null | awk -F': ' '/Port:/{print $2; exit}')"
+
+  [ "$web_enabled" = "Yes" ] || return 1
+  [ "$web_server" = "$SURGE_HTTP_HOST" ] || return 1
+  [ "$web_port" = "$SURGE_HTTP_PORT" ] || return 1
+  [ "$https_enabled" = "Yes" ] || return 1
+  [ "$https_server" = "$SURGE_HTTP_HOST" ] || return 1
+  [ "$https_port" = "$SURGE_HTTP_PORT" ] || return 1
+  [ "$socks_enabled" = "Yes" ] || return 1
+  [ "$socks_server" = "$SURGE_SOCKS_HOST" ] || return 1
+  [ "$socks_port" = "$SURGE_SOCKS_PORT" ] || return 1
 }
 
 service_proxy_enabled_any() {
@@ -1114,6 +1353,61 @@ global_proxy_points_to_surge() {
   [ "$sp" = "$SURGE_HTTP_PORT" ] || return 1
 }
 
+infer_managed_services_joined() {
+  local mode="${1:-}" matches=() svc
+
+  while IFS= read -r svc; do
+    [ -n "$svc" ] || continue
+    case "$mode" in
+      stack-proxy)
+        if service_proxy_points_to_stack "$svc"; then
+          matches+=("$svc")
+        fi
+        ;;
+      surge)
+        if service_proxy_points_to_surge "$svc"; then
+          matches+=("$svc")
+        fi
+        ;;
+    esac
+  done < <(all_eligible_services)
+
+  if [ "${#matches[@]}" -gt 0 ]; then
+    local joined
+    joined="$(printf '%s\n' "${matches[@]}" | awk 'BEGIN { first=1 } NF { if (!first) printf ", "; printf "%s", $0; first=0 } END { if (!first) printf "\n" }')"
+    printf '%s' "$joined"
+    return 0
+  fi
+
+  return 1
+}
+
+managed_services_refresh_from_system_proxy() {
+  local inferred=""
+
+  if global_proxy_points_to_stack; then
+    inferred="$(infer_managed_services_joined stack-proxy || true)"
+  elif global_proxy_points_to_surge; then
+    inferred="$(infer_managed_services_joined surge || true)"
+  fi
+
+  if [ -n "$inferred" ]; then
+    printf '%s\n' "$inferred" | awk -F', ' '{ for (i = 1; i <= NF; i++) print $i }' | {
+      local refreshed=()
+      while IFS= read -r line; do
+        [ -n "$line" ] && refreshed+=("$line")
+      done
+      if [ "${#refreshed[@]}" -gt 0 ]; then
+        managed_services_save "${refreshed[@]}"
+      else
+        managed_services_clear
+      fi
+    }
+  else
+    managed_services_clear
+  fi
+}
+
 shell_proxy_points_to_stack() {
   [ "$(shell_proxy_enabled_value)" = "yes" ] || return 1
   [ "$(proxy_core_running_value)" = "yes" ] || return 1
@@ -1125,6 +1419,17 @@ wait_global_stack_proxy_enabled() {
   local i
   for i in $(seq 1 8); do
     if global_proxy_points_to_stack; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+wait_global_surge_proxy_enabled() {
+  local i
+  for i in $(seq 1 8); do
+    if global_proxy_points_to_surge; then
       return 0
     fi
     sleep 0.5
@@ -1197,21 +1502,26 @@ current_mode() {
     return 0
   fi
 
-  if [ "$(surge_running_value)" = "yes" ]; then
-    echo "mode=surge"
-  else
-    echo "mode=direct"
-  fi
+  echo "mode=direct"
 }
 
 info_status() {
-  local mode_line mode svc iface
+  local mode_line mode svc iface managed_svc
   health_state_load
   mode_line="$(current_mode)"
   mode="${mode_line#mode=}"
-  svc="$(active_global_service || true)"
+
+  managed_svc="$(managed_services_joined_value || true)"
+  if [ -z "$managed_svc" ]; then
+    managed_svc="$(infer_managed_services_joined "$mode" || true)"
+  fi
+
+  svc="$managed_svc"
   if [ -z "$svc" ]; then
-    svc="$(active_primary_service || true)"
+    svc="$(preferred_active_service || true)"
+  fi
+  if [ -z "$svc" ]; then
+    svc="$(active_global_service || true)"
   fi
   iface="$(default_interface_value || true)"
 
@@ -1221,7 +1531,7 @@ info_status() {
   else
     echo "service=${iface:-unknown}"
   fi
-  echo "shell_proxy=$( [ -f "$SHELL_ENV_FILE" ] && echo on || echo off )"
+  echo "shell_proxy=$( [ "$(shell_proxy_enabled_value)" = "yes" ] && echo on || echo off )"
   echo "tun_installed=$(tun_installed_value)"
   echo "tun_loaded=$(tun_loaded_value)"
   echo "tun_running=$(tun_running_value)"
@@ -1268,7 +1578,8 @@ start_surge() {
 wait_surge_proxy_ready() {
   local i
   for i in $(seq 1 "$surge_proxy_wait_attempts"); do
-    if lsof -nP -iTCP:"${SURGE_SOCKS_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
+    if lsof -nP -iTCP:"${SURGE_HTTP_PORT}" -sTCP:LISTEN >/dev/null 2>&1 &&
+      lsof -nP -iTCP:"${SURGE_SOCKS_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.25
@@ -1324,6 +1635,111 @@ probe_public_ip_via_socks_proxy() {
   return 1
 }
 
+relay_proxy_url() {
+  case "${UPSTREAM_PROXY_TYPE:-socks}" in
+    socks|socks5)
+      echo "socks5h://127.0.0.1:${FORWARD_LOCAL_PORT}"
+      ;;
+    http)
+      echo "http://127.0.0.1:${FORWARD_LOCAL_PORT}"
+      ;;
+    https)
+      echo "https://127.0.0.1:${FORWARD_LOCAL_PORT}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+probe_public_ip_via_relay() {
+  local proxy_url payload ip url
+  local auth_args=()
+
+  proxy_url="$(relay_proxy_url)" || return 1
+  if [ -n "${UPSTREAM_PROXY_USER:-}" ] || [ -n "${UPSTREAM_PROXY_PASS:-}" ]; then
+    auth_args=(--proxy-user "${UPSTREAM_PROXY_USER:-}:${UPSTREAM_PROXY_PASS:-}")
+  fi
+
+  for url in "${PUBLIC_IP_PROBE_URLS[@]}"; do
+    payload="$(curl -4 -s --connect-timeout "$probe_connect_timeout" --max-time "$probe_max_time" \
+      --proxy "$proxy_url" "${auth_args[@]}" "$url" || true)"
+    ip="$(extract_ipv4_from_payload "$payload" || true)"
+    if [ -n "$ip" ]; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+probe_https_via_relay() {
+  local proxy_url code url
+  local auth_args=()
+
+  proxy_url="$(relay_proxy_url)" || return 1
+  if [ -n "${UPSTREAM_PROXY_USER:-}" ] || [ -n "${UPSTREAM_PROXY_PASS:-}" ]; then
+    auth_args=(--proxy-user "${UPSTREAM_PROXY_USER:-}:${UPSTREAM_PROXY_PASS:-}")
+  fi
+
+  for url in "${HTTPS_CONNECT_PROBE_URLS[@]}"; do
+    code="$(curl -4 -s -o /dev/null -w '%{http_code}' --connect-timeout "$probe_connect_timeout" \
+      --max-time "$probe_max_time" --proxy "$proxy_url" "${auth_args[@]}" "$url" || true)"
+    [ -n "$code" ] || code="000"
+    if [ "$code" != "000" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+wait_tunnel_transport_ready() {
+  local i relay_ip
+
+  for i in $(seq 1 6); do
+    if [ "$(tunnel_running_value)" != "yes" ]; then
+      sleep 1
+      continue
+    fi
+
+    relay_ip="$(probe_public_ip_via_relay || true)"
+    if [ -n "$relay_ip" ]; then
+      echo "relay_ready_ip=$relay_ip"
+      return 0
+    fi
+
+    if [ "$i" -ge 2 ] && probe_https_via_relay; then
+      echo "relay_ready_ip=unknown"
+      return 0
+    fi
+
+    sleep 1
+  done
+
+  return 1
+}
+
+ensure_tunnel_transport_ready() {
+  local attempt
+
+  start_tunnel_service >/dev/null 2>&1 || true
+  if wait_tunnel_transport_ready; then
+    return 0
+  fi
+
+  for attempt in 1 2; do
+    echo "relay_repair_attempt=$attempt"
+    restart_tunnel_service >/dev/null 2>&1 || true
+    if wait_tunnel_transport_ready; then
+      echo "relay_repair_result=recovered"
+      return 0
+    fi
+  done
+
+  echo "relay_repair_result=failed"
+  return 1
+}
+
 probe_public_ip_direct() {
   local url payload ip
   for url in "${PUBLIC_IP_PROBE_URLS[@]}"; do
@@ -1336,6 +1752,157 @@ probe_public_ip_direct() {
     fi
   done
   return 1
+}
+
+system_proxy_probe_via_cfnetwork() {
+  local url_list="${1:-}" mode="${2:-ip}"
+  [ -n "$url_list" ] || return 1
+
+  SYSTEM_PROXY_PROBE_MODE="$mode" \
+    SYSTEM_PROXY_PROBE_URLS="$url_list" \
+    /usr/bin/swift - <<'SWIFT'
+import Foundation
+
+let mode = ProcessInfo.processInfo.environment["SYSTEM_PROXY_PROBE_MODE"] ?? "ip"
+let raw = ProcessInfo.processInfo.environment["SYSTEM_PROXY_PROBE_URLS"] ?? ""
+let urls = raw.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+guard !urls.isEmpty else { exit(1) }
+
+let cfg = URLSessionConfiguration.ephemeral
+cfg.timeoutIntervalForRequest = 8
+cfg.timeoutIntervalForResource = 10
+let session = URLSession(configuration: cfg)
+
+for rawURL in urls {
+    guard let url = URL(string: rawURL) else { continue }
+    let sem = DispatchSemaphore(value: 0)
+    var body: String?
+    var statusCode: Int?
+
+    let task = session.dataTask(with: url) { data, response, _ in
+        if let http = response as? HTTPURLResponse {
+            statusCode = http.statusCode
+        }
+        if let data {
+            body = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        sem.signal()
+    }
+
+    task.resume()
+    let result = sem.wait(timeout: .now() + 10)
+    if result == .timedOut {
+        task.cancel()
+        continue
+    }
+
+    if mode == "https" {
+        if let statusCode, statusCode > 0 {
+            print(statusCode)
+            exit(0)
+        }
+        continue
+    }
+
+    if let body, !body.isEmpty {
+      print(body)
+      exit(0)
+    }
+}
+
+exit(1)
+SWIFT
+}
+
+probe_public_ip_via_system_proxy() {
+  local urls
+  urls="$(printf '%s\n' "${PUBLIC_IP_PROBE_URLS[@]}")"
+  system_proxy_probe_via_cfnetwork "$urls" ip || return 1
+}
+
+probe_https_via_system_proxy() {
+  local urls code
+  urls="$(printf '%s\n' "${HTTPS_CONNECT_PROBE_URLS[@]}")"
+  code="$(system_proxy_probe_via_cfnetwork "$urls" https || true)"
+  [ -n "$code" ] || code="000"
+  [ "$code" != "000" ]
+}
+
+api_http_code_via_proxy() {
+  local proxy_url="$1" url="$2"
+  shift 2
+
+  local code
+  code="$(curl -4 -sS -o /dev/null -w '%{http_code}' \
+    --connect-timeout "$probe_connect_timeout" --max-time "$probe_max_time" \
+    --proxy "$proxy_url" "$@" "$url" || true)"
+  [ -n "$code" ] || code="000"
+  printf '%s' "$code"
+}
+
+api_http_code_via_system_proxy() {
+  local url="$1" code
+  code="$(system_proxy_probe_via_cfnetwork "$(printf '%s\n' "$url")" https || true)"
+  [ -n "$code" ] || code="000"
+  printf '%s' "$code"
+}
+
+verify_cli_apis() {
+  local openai_url="https://api.openai.com/v1/models"
+  local anthropic_url="https://api.anthropic.com/v1/messages"
+  local relay_proxy="" local_http_proxy="" local_socks_proxy=""
+  local relay_openai relay_anthropic local_http_openai local_http_anthropic local_socks_openai local_socks_anthropic system_openai system_anthropic
+  local auth_args=()
+
+  local_http_proxy="http://${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}"
+  local_socks_proxy="socks5h://${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}"
+  relay_proxy="$(relay_proxy_url || true)"
+
+  if [ -n "${UPSTREAM_PROXY_USER:-}" ] || [ -n "${UPSTREAM_PROXY_PASS:-}" ]; then
+    auth_args=(--proxy-user "${UPSTREAM_PROXY_USER:-}:${UPSTREAM_PROXY_PASS:-}")
+  fi
+
+  echo "[cli api reachability]"
+
+  if [ -n "$relay_proxy" ]; then
+    relay_openai="$(api_http_code_via_proxy "$relay_proxy" "$openai_url" "${auth_args[@]}")"
+    relay_anthropic="$(api_http_code_via_proxy "$relay_proxy" "$anthropic_url" "${auth_args[@]}")"
+    echo "relay_openai=$relay_openai"
+    echo "relay_anthropic=$relay_anthropic"
+  fi
+
+  if [ "$(proxy_core_running_value)" = "yes" ]; then
+    local_http_openai="$(api_http_code_via_proxy "$local_http_proxy" "$openai_url")"
+    local_http_anthropic="$(api_http_code_via_proxy "$local_http_proxy" "$anthropic_url")"
+    local_socks_openai="$(api_http_code_via_proxy "$local_socks_proxy" "$openai_url")"
+    local_socks_anthropic="$(api_http_code_via_proxy "$local_socks_proxy" "$anthropic_url")"
+    echo "local_http_openai=$local_http_openai"
+    echo "local_http_anthropic=$local_http_anthropic"
+    echo "local_socks_openai=$local_socks_openai"
+    echo "local_socks_anthropic=$local_socks_anthropic"
+  fi
+
+  if global_proxy_enabled_any; then
+    system_openai="$(api_http_code_via_system_proxy "$openai_url")"
+    system_anthropic="$(api_http_code_via_system_proxy "$anthropic_url")"
+    echo "system_openai=$system_openai"
+    echo "system_anthropic=$system_anthropic"
+  else
+    echo "system_openai=skip"
+    echo "system_anthropic=skip"
+  fi
+
+  if [ -n "${relay_openai:-}" ] && [ "$relay_openai" = "000" -o "$relay_anthropic" = "000" ]; then
+    return 1
+  fi
+  if [ -n "${local_http_openai:-}" ] && [ "$local_http_openai" = "000" -o "$local_http_anthropic" = "000" -o "$local_socks_openai" = "000" -o "$local_socks_anthropic" = "000" ]; then
+    return 1
+  fi
+  if [ -n "${system_openai:-}" ] && [ "$system_openai" != "skip" ] && [ "$system_openai" = "000" -o "$system_anthropic" = "000" ]; then
+    return 1
+  fi
+
+  return 0
 }
 
 probe_https_via_http_proxy() {
@@ -1546,6 +2113,42 @@ handle_stack_failure() {
   return 1
 }
 
+stack_proxy_reason_repairable() {
+  case "${1:-}" in
+    relay-listener-down|proxy-core-down|http-probe-failed|socks-probe-failed)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+repair_stack_proxy_once() {
+  local snapshot
+
+  echo "stack_repair=attempt"
+  if ! ensure_tunnel_transport_ready; then
+    echo "stack_repair=relay-unready"
+    return 1
+  fi
+
+  if ! restart_proxy_core_service; then
+    echo "stack_repair=proxy-core-restart-failed"
+    return 1
+  fi
+
+  snapshot="$(stack_proxy_health_snapshot || true)"
+  printf '%s\n' "$snapshot"
+  if printf '%s\n' "$snapshot" | grep -q '^healthy=yes$'; then
+    echo "stack_repair=recovered"
+    return 0
+  fi
+
+  echo "stack_repair=failed"
+  return 1
+}
+
 health_monitor_once() (
   local snapshot mode_line mode reason
 
@@ -1577,6 +2180,14 @@ health_monitor_once() (
       fi
 
       reason="$(printf '%s\n' "$snapshot" | awk -F= '/^reason=/{print substr($0, 8); exit}')"
+      if [ "$mode" = "stack-proxy" ] && stack_proxy_reason_repairable "$reason"; then
+        echo "health_repair=attempt"
+        if repair_stack_proxy_once; then
+          health_state_record_success "$mode"
+          echo "health_failure_count=0"
+          exit 0
+        fi
+      fi
       health_state_record_failure "$mode" "$reason"
       health_state_load
       echo "health_failure_count=${health_failure_count:-0}"
@@ -1596,6 +2207,15 @@ health_monitor_once() (
       ;;
   esac
 )
+
+health_monitor_loop() {
+  trap 'exit 0' INT TERM
+
+  while true; do
+    health_monitor_once || true
+    sleep "$health_monitor_interval"
+  done
+}
 
 wait_stack_proxy_relay_ready_before_cutover() {
   local direct_before="${1:-}" i consecutive=0 snapshot http_ip socks_ip ready_reason
@@ -1798,6 +2418,249 @@ wait_stack_tun_post_cutover_ready() {
   return 1
 }
 
+verify_stack_scope() {
+  local direct_ip="" relay_ip="" http_ip="" socks_ip="" system_ip=""
+
+  echo "scope=stack-proxy"
+
+  if ! global_proxy_points_to_stack; then
+    echo "system_proxy=failed"
+    return 1
+  fi
+  echo "system_proxy=ok"
+
+  system_ip="$(probe_public_ip_via_system_proxy || true)"
+  if [ -n "$system_ip" ]; then
+    echo "system_ip=$system_ip"
+  elif probe_https_via_system_proxy; then
+    system_ip="unknown"
+    echo "system_ip=$system_ip"
+  else
+    echo "system_proxy=failed:cfnetwork-unreachable"
+    return 1
+  fi
+
+  if [ "${AUTO_SHELL_ENABLE_ON_STACK:-1}" = "1" ]; then
+    if shell_env_matches_current; then
+      echo "new_terminal=ok"
+    else
+      echo "new_terminal=failed"
+      return 1
+    fi
+  else
+    echo "new_terminal=skip"
+  fi
+
+  if [ "$(proxy_core_running_value)" != "yes" ]; then
+    echo "legacy_terminal=failed:proxy-core-down"
+    return 1
+  fi
+
+  relay_ip="$(probe_public_ip_via_relay || true)"
+  if [ -n "$relay_ip" ]; then
+    echo "relay_ip=$relay_ip"
+  elif probe_https_via_relay; then
+    echo "relay_ip=unknown"
+  else
+    echo "legacy_terminal=failed:relay-unreachable"
+    return 1
+  fi
+
+  http_ip="$(probe_public_ip_via_http_proxy || true)"
+  if [ -n "$http_ip" ]; then
+    echo "legacy_http_ip=$http_ip"
+  elif probe_https_via_http_proxy; then
+    http_ip="unknown"
+    echo "legacy_http_ip=$http_ip"
+  else
+    echo "legacy_terminal=failed:http-bridge-unreachable"
+    return 1
+  fi
+
+  socks_ip="$(probe_public_ip_via_socks_proxy || true)"
+  if [ -n "$socks_ip" ]; then
+    echo "legacy_socks_ip=$socks_ip"
+  elif probe_https_via_socks_proxy; then
+    socks_ip="unknown"
+    echo "legacy_socks_ip=$socks_ip"
+  else
+    echo "legacy_terminal=failed:socks-bridge-unreachable"
+    return 1
+  fi
+
+  direct_ip="$(probe_public_ip_direct_fast || true)"
+  [ -n "$direct_ip" ] && echo "direct_ip=$direct_ip"
+
+  if [ -n "$relay_ip" ] && [ "$relay_ip" != "unknown" ]; then
+    if [ -n "$system_ip" ] && [ "$system_ip" != "unknown" ] && [ "$system_ip" != "$relay_ip" ]; then
+      echo "system_proxy=failed:cfnetwork-egress-mismatch"
+      return 1
+    fi
+    if [ -n "$http_ip" ] && [ "$http_ip" != "unknown" ] && [ "$http_ip" != "$relay_ip" ]; then
+      echo "legacy_terminal=failed:http-egress-mismatch"
+      return 1
+    fi
+    if [ -n "$socks_ip" ] && [ "$socks_ip" != "unknown" ] && [ "$socks_ip" != "$relay_ip" ]; then
+      echo "legacy_terminal=failed:socks-egress-mismatch"
+      return 1
+    fi
+  fi
+
+  if [ -n "$direct_ip" ]; then
+    if [ -n "$http_ip" ] && [ "$http_ip" != "unknown" ] && [ "$http_ip" = "$direct_ip" ]; then
+      echo "legacy_terminal=failed:http-still-direct"
+      return 1
+    fi
+    if [ -n "$socks_ip" ] && [ "$socks_ip" != "unknown" ] && [ "$socks_ip" = "$direct_ip" ]; then
+      echo "legacy_terminal=failed:socks-still-direct"
+      return 1
+    fi
+  fi
+
+  echo "legacy_terminal=ok"
+  echo "scope_result=ok"
+}
+
+verify_surge_scope() {
+  local system_ip=""
+
+  echo "scope=surge"
+
+  if ! wait_surge_proxy_ready; then
+    echo "surge_proxy=failed"
+    return 1
+  fi
+  echo "surge_proxy=ok"
+
+  if ! global_proxy_points_to_surge; then
+    echo "system_proxy=failed"
+    return 1
+  fi
+  echo "system_proxy=ok"
+
+  system_ip="$(probe_public_ip_via_system_proxy || true)"
+  if [ -n "$system_ip" ]; then
+    echo "system_ip=$system_ip"
+  elif probe_https_via_system_proxy; then
+    echo "system_ip=unknown"
+  else
+    echo "system_proxy=failed:cfnetwork-unreachable"
+    return 1
+  fi
+
+  if [ "$(shell_proxy_enabled_value)" = "yes" ]; then
+    echo "new_terminal=failed"
+    return 1
+  fi
+  echo "new_terminal=off"
+
+  if [ "$(proxy_core_running_value)" != "yes" ]; then
+    echo "legacy_terminal=failed:proxy-core-down"
+    return 1
+  fi
+  if [ "${proxy_core_upstream_mode:-}" != "surge" ]; then
+    echo "legacy_terminal=failed:bridge-upstream-not-surge"
+    return 1
+  fi
+
+  if ! probe_https_via_http_proxy; then
+    echo "legacy_terminal=failed:http-bridge-unreachable"
+    return 1
+  fi
+  if ! probe_https_via_socks_proxy; then
+    echo "legacy_terminal=failed:socks-bridge-unreachable"
+    return 1
+  fi
+
+  echo "legacy_terminal=ok"
+  echo "scope_result=ok"
+}
+
+verify_direct_scope() {
+  echo "scope=direct"
+
+  if global_proxy_enabled_any; then
+    echo "system_proxy=failed"
+    return 1
+  fi
+  echo "system_proxy=off"
+
+  if [ "$(shell_proxy_enabled_value)" = "yes" ]; then
+    echo "new_terminal=failed"
+    return 1
+  fi
+  echo "new_terminal=off"
+
+  if [ "$(proxy_core_running_value)" != "yes" ]; then
+    echo "legacy_terminal=failed:proxy-core-down"
+    return 1
+  fi
+  if [ "${proxy_core_upstream_mode:-}" != "direct" ]; then
+    echo "legacy_terminal=failed:bridge-upstream-not-direct"
+    return 1
+  fi
+
+  if ! probe_https_via_http_proxy; then
+    echo "legacy_terminal=failed:http-bridge-unreachable"
+    return 1
+  fi
+  if ! probe_https_via_socks_proxy; then
+    echo "legacy_terminal=failed:socks-bridge-unreachable"
+    return 1
+  fi
+
+  echo "legacy_terminal=ok"
+  echo "scope_result=ok"
+}
+
+verify_current_scope() {
+  local mode_line mode
+  mode_line="$(current_mode)"
+  mode="${mode_line#mode=}"
+
+  case "$mode" in
+    stack-proxy)
+      verify_stack_scope
+      ;;
+    surge)
+      verify_surge_scope
+      ;;
+    direct)
+      verify_direct_scope
+      ;;
+    *)
+      echo "scope=$mode"
+      echo "scope_result=skip"
+      ;;
+  esac
+}
+
+session_sync() {
+  cat <<EOF_SYNC
+_dmit_iproyal_apply_shell_state() {
+  local env_file="\${DMIT_IPROYAL_SHELL_ENV_FILE:-$SHELL_ENV_FILE}"
+  if [ -r "\$env_file" ]; then
+    . "\$env_file"
+  else
+    unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy
+  fi
+}
+if [ -n "\${ZSH_VERSION:-}" ]; then
+  case "\$-" in
+    *i*)
+      case " \${precmd_functions[*]:-} " in
+        *" _dmit_iproyal_apply_shell_state "*) ;;
+        *)
+          precmd_functions+=(_dmit_iproyal_apply_shell_state)
+          ;;
+      esac
+      ;;
+  esac
+fi
+_dmit_iproyal_apply_shell_state
+EOF_SYNC
+}
+
 rollback_to_stack_proxy() {
   tun_stop >/dev/null 2>&1 || true
   start_tunnel_service >/dev/null 2>&1 || true
@@ -1819,15 +2682,26 @@ use_stack_proxy() {
   direct_before="$(probe_public_ip_direct_fast || true)"
 
   ensure_tun_stopped_if_running
-  start_tunnel_service
+  if [ "${STOP_SURGE_WHEN_STACK:-1}" = "1" ]; then
+    stop_surge
+    wait_preferred_active_service_ready >/dev/null 2>&1 || true
+  fi
+  if ! ensure_tunnel_transport_ready; then
+    echo "relay_transport=failed"
+    handle_stack_failure "stack-proxy" "relay_transport_ready_failed" || true
+    return 1
+  fi
   set_proxy_core_upstream_mode relay
   start_proxy_core_service >/dev/null 2>&1 || true
   wait_proxy_core_ready || true
 
   if ! wait_stack_proxy_relay_ready_before_cutover "$direct_before"; then
-    echo "stack_precutover=failed"
-    handle_stack_failure "stack-proxy" "stack_proxy_precutover_failed" || true
-    return 1
+    echo "stack_precutover=retry-after-relay-repair"
+    if ! ensure_tunnel_transport_ready || ! wait_stack_proxy_relay_ready_before_cutover "$direct_before"; then
+      echo "stack_precutover=failed"
+      handle_stack_failure "stack-proxy" "stack_proxy_precutover_failed" || true
+      return 1
+    fi
   fi
 
   proxy_off_all >/dev/null 2>&1 || true
@@ -1844,19 +2718,29 @@ use_stack_proxy() {
   fi
 
   if ! wait_stack_proxy_ready; then
-    echo "stack_ready=failed"
-    handle_stack_failure "stack-proxy" "stack_proxy_ready_failed" || true
-    return 1
+    echo "stack_ready=repair-attempt"
+    if ! repair_stack_proxy_once || ! wait_stack_proxy_ready; then
+      echo "stack_ready=failed"
+      handle_stack_failure "stack-proxy" "stack_proxy_ready_failed" || true
+      return 1
+    fi
   fi
 
   if ! wait_stack_proxy_post_cutover_ready; then
-    echo "stack_postcheck=failed"
-    handle_stack_failure "stack-proxy" "stack_proxy_postcheck_failed" || true
-    return 1
+    echo "stack_postcheck=repair-attempt"
+    if ! repair_stack_proxy_once || ! wait_stack_proxy_post_cutover_ready; then
+      echo "stack_postcheck=failed"
+      handle_stack_failure "stack-proxy" "stack_proxy_postcheck_failed" || true
+      return 1
+    fi
   fi
 
-  if [ "${STOP_SURGE_WHEN_STACK:-1}" = "1" ]; then
-    stop_surge
+  if ! verify_stack_scope; then
+    echo "stack_scope=repair-attempt"
+    if ! repair_stack_proxy_once || ! verify_stack_scope; then
+      handle_stack_failure "stack-proxy" "stack_proxy_scope_verify_failed" || true
+      return 1
+    fi
   fi
 
   health_state_record_success "stack-proxy"
@@ -1873,7 +2757,11 @@ use_stack_tun() {
 
   rotate_user_logs_if_needed
   start_health_monitor_service >/dev/null 2>&1 || true
-  start_tunnel_service
+  if ! ensure_tunnel_transport_ready; then
+    echo "relay_transport=failed"
+    handle_stack_failure "stack-tun" "relay_transport_ready_failed" || true
+    return 1
+  fi
   set_proxy_core_upstream_mode relay >/dev/null 2>&1 || true
 
   if [ "$(proxy_core_running_value)" = "yes" ]; then
@@ -1972,24 +2860,46 @@ use_stack_auto_gui() {
 use_surge() {
   rotate_user_logs_if_needed
   start_health_monitor_service >/dev/null 2>&1 || true
-  proxy_off_all
-  shell_off
   ensure_tun_stopped_if_running
 
   if [ "${START_SURGE_WHEN_OFF:-1}" = "1" ]; then
     start_surge
-    wait_surge_proxy_ready || true
   fi
+
+  if ! wait_surge_proxy_ready; then
+    echo "surge_ready=failed"
+    return 1
+  fi
+
+  set_proxy_core_upstream_mode surge
+  start_proxy_core_service >/dev/null 2>&1 || true
+  if ! wait_proxy_core_ready; then
+    echo "surge_bridge=failed"
+    return 1
+  fi
+
+  proxy_off_all >/dev/null 2>&1 || true
+  proxy_on_surge "$@"
+  if ! wait_global_surge_proxy_enabled; then
+    echo "surge_system_proxy=failed"
+    proxy_off_all >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  shell_off
 
   if [ "$keep_tunnel_warm_on_surge" = "1" ]; then
     start_tunnel_service >/dev/null 2>&1 || true
   else
     stop_tunnel_service
   fi
-  set_proxy_core_upstream_mode surge
-  start_proxy_core_service >/dev/null 2>&1 || true
-  wait_proxy_core_ready || true
 
+  if ! verify_surge_scope; then
+    echo "surge_scope=failed"
+    return 1
+  fi
+
+  health_state_record_success "surge"
   echo "mode=surge"
 }
 
@@ -2012,7 +2922,14 @@ use_direct() {
   set_proxy_core_upstream_mode direct
   start_proxy_core_service >/dev/null 2>&1 || true
   wait_proxy_core_ready || true
+  managed_services_clear
 
+  if ! verify_direct_scope; then
+    echo "direct_scope=failed"
+    return 1
+  fi
+
+  health_state_record_success "direct"
   echo "mode=direct"
 }
 
@@ -2121,10 +3038,15 @@ status_services() {
 }
 
 doctor() {
-  local direct_ip http_ip socks_ip
+  local direct_ip system_ip http_ip socks_ip relay_ip
 
   echo "[info]"
   info_status
+  echo
+  echo "[scope verification]"
+  verify_current_scope || true
+  echo
+  verify_cli_apis || true
   echo
   echo "[health snapshot]"
   health_check_current_mode || true
@@ -2149,6 +3071,17 @@ doctor() {
   fi
   echo
 
+  echo "[egress via system proxy]"
+  system_ip="$(probe_public_ip_via_system_proxy || true)"
+  if [ -n "$system_ip" ]; then
+    echo "$system_ip"
+  elif probe_https_via_system_proxy; then
+    echo "reachable (ip unknown)"
+  else
+    echo "fail"
+  fi
+  echo
+
   echo "[egress via local http]"
   http_ip="$(probe_public_ip_via_http_proxy || true)"
   if [ -n "$http_ip" ]; then
@@ -2165,6 +3098,17 @@ doctor() {
   if [ -n "$socks_ip" ]; then
     echo "$socks_ip"
   elif probe_https_via_socks_proxy; then
+    echo "reachable (ip unknown)"
+  else
+    echo "fail"
+  fi
+  echo
+
+  echo "[egress via relay]"
+  relay_ip="$(probe_public_ip_via_relay || true)"
+  if [ -n "$relay_ip" ]; then
+    echo "$relay_ip"
+  elif probe_https_via_relay; then
     echo "reachable (ip unknown)"
   else
     echo "fail"
@@ -2196,8 +3140,12 @@ Usage:
   $0 info
   $0 doctor
   $0 test
+  $0 verify-scope
+  $0 verify-cli-apis
   $0 health-check
   $0 health-monitor-once
+  $0 health-monitor-loop
+  $0 session-sync
   $0 proxy-on [service ...]
   $0 proxy-off [service ...]
   $0 proxy-off-all
@@ -2263,11 +3211,23 @@ case "$cmd" in
   test)
     test_stack
     ;;
+  verify-scope)
+    verify_current_scope
+    ;;
+  verify-cli-apis)
+    verify_cli_apis
+    ;;
   health-check)
     health_check_current_mode
     ;;
+  session-sync)
+    session_sync
+    ;;
   health-monitor-once)
     health_monitor_once
+    ;;
+  health-monitor-loop)
+    health_monitor_loop
     ;;
   proxy-on)
     shift

@@ -26,6 +26,7 @@ health_monitor_loaded=""
 health_degraded=""
 auto_fallback=""
 last_failure_reason=""
+mode_switch_active="no"
 
 while IFS='=' read -r k v; do
   case "$k" in
@@ -58,6 +59,9 @@ done < <("$CTL" info 2>/dev/null || true)
 [ -n "$health_degraded" ] || health_degraded="unknown"
 [ -n "$auto_fallback" ] || auto_fallback="unknown"
 [ -n "$last_failure_reason" ] || last_failure_reason="none"
+if [ -d "${HOME}/.config/dmit-iproyal/state/mode-switch.lock" ]; then
+  mode_switch_active="yes"
+fi
 
 label="D-ISP ?"
 color="#E53E3E"
@@ -93,7 +97,10 @@ case "$mode" in
     ;;
 esac
 
-if [ "$auto_fallback" = "yes" ]; then
+if [ "$mode_switch_active" = "yes" ]; then
+  label="D-ISP ..."
+  color="#2563EB"
+elif [ "$auto_fallback" = "yes" ]; then
   label="D-ISP SURGE!"
   color="#C2410C"
 elif [ "$health_degraded" = "yes" ]; then
@@ -127,9 +134,11 @@ echo "--Tunnel Running: $tunnel_running"
 echo "--Health Monitor: $health_monitor_loaded"
 echo "--Degraded: $health_degraded"
 echo "--Auto Fallback: $auto_fallback"
+echo "--Mode Switch Active: $mode_switch_active"
 echo "--Last Failure: $last_failure_reason"
 echo "--Refresh Status | refresh=true"
 echo "--Quick Test Exit IP | bash=$CTL param1=test terminal=false refresh=true"
+echo "--Verify Routing Scope | bash=$CTL param1=verify-scope terminal=false refresh=true"
 echo "--Doctor | bash=$CTL param1=doctor terminal=false refresh=true"
 
 echo "---"
