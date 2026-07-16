@@ -13,6 +13,17 @@ if [ ! -x "$CTL" ]; then
   exit 0
 fi
 
+ENV_FILE="${DMIT_IPROYAL_ENV_FILE:-$HOME/.config/dmit-iproyal/env}"
+upstream_host=""
+upstream_port=""
+
+if [ -f "$ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  upstream_host="${UPSTREAM_PROXY_HOST:-${IPROYAL_HOST:-}}"
+  upstream_port="${UPSTREAM_PROXY_PORT:-${IPROYAL_PORT:-}}"
+fi
+
 mode=""
 service=""
 shell_proxy=""
@@ -21,6 +32,7 @@ tun_loaded=""
 tun_running=""
 surge_running=""
 proxy_core_running=""
+proxy_core_upstream=""
 tunnel_running=""
 health_monitor_loaded=""
 health_degraded=""
@@ -38,6 +50,7 @@ while IFS='=' read -r k v; do
     tun_running) tun_running="$v" ;;
     surge_running) surge_running="$v" ;;
     proxy_core_running) proxy_core_running="$v" ;;
+    proxy_core_upstream) proxy_core_upstream="$v" ;;
     tunnel_running) tunnel_running="$v" ;;
     health_monitor_loaded) health_monitor_loaded="$v" ;;
     health_degraded) health_degraded="$v" ;;
@@ -59,8 +72,38 @@ done < <("$CTL" info 2>/dev/null || true)
 [ -n "$health_degraded" ] || health_degraded="unknown"
 [ -n "$auto_fallback" ] || auto_fallback="unknown"
 [ -n "$last_failure_reason" ] || last_failure_reason="none"
+[ -n "$proxy_core_upstream" ] || proxy_core_upstream="unknown"
+[ -n "$upstream_host" ] || upstream_host="unknown"
+[ -n "$upstream_port" ] || upstream_port="unknown"
 if [ -d "${HOME}/.config/dmit-iproyal/state/mode-switch.lock" ]; then
   mode_switch_active="yes"
+fi
+
+route_label="unknown"
+case "$mode" in
+  stack-proxy|stack-tun|shell-proxy)
+    if [ "$proxy_core_upstream" = "relay" ] && [ "$tunnel_running" = "yes" ]; then
+      route_label="Mac → VPS → ISP (${upstream_host}:${upstream_port})"
+    elif [ "$proxy_core_upstream" = "relay" ]; then
+      route_label="VPS→ISP (tunnel down)"
+    else
+      route_label="local bridge (${proxy_core_upstream})"
+    fi
+    ;;
+  surge)
+    route_label="Surge handoff"
+    ;;
+  direct)
+    route_label="Direct (no proxy)"
+    ;;
+  *)
+    route_label="$mode"
+    ;;
+esac
+
+failure_note=""
+if [ "$health_degraded" = "yes" ] && [ -n "$last_failure_reason" ] && [ "$last_failure_reason" != "none" ]; then
+  failure_note="$last_failure_reason"
 fi
 
 label="D-ISP ?"
@@ -114,6 +157,9 @@ echo "$label | color=$color"
 echo "---"
 echo "Current: $label"
 echo "Network Service: $service"
+echo "Route: $route_label"
+echo "Upstream ISP: ${upstream_host}:${upstream_port}"
+echo "Proxy Core Upstream: $proxy_core_upstream"
 
 echo "---"
 echo "Use Proxy (Stable) | bash=$CTL param1=use-stack-proxy-gui terminal=false refresh=true"
@@ -135,7 +181,11 @@ echo "--Health Monitor: $health_monitor_loaded"
 echo "--Degraded: $health_degraded"
 echo "--Auto Fallback: $auto_fallback"
 echo "--Mode Switch Active: $mode_switch_active"
-echo "--Last Failure: $last_failure_reason"
+if [ -n "$failure_note" ]; then
+  echo "--Last Failure: $failure_note"
+else
+  echo "--Last Failure: none (healthy)"
+fi
 echo "--Refresh Status | refresh=true"
 echo "--Quick Test Exit IP | bash=$CTL param1=test terminal=false refresh=true"
 echo "--Verify Routing Scope | bash=$CTL param1=verify-scope terminal=false refresh=true"

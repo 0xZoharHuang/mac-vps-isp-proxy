@@ -14,6 +14,7 @@ SURGE_SOCKS_PORT="${SURGE_SOCKS_PORT:-6153}"
 UPSTREAM_PROXY_TYPE="${UPSTREAM_PROXY_TYPE:-socks}"
 UPSTREAM_PROXY_USER="${UPSTREAM_PROXY_USER-${IPROYAL_USER:-}}"
 UPSTREAM_PROXY_PASS="${UPSTREAM_PROXY_PASS-${IPROYAL_PASS:-}}"
+SOCKS_VIA_HTTP_BRIDGE="${SOCKS_VIA_HTTP_BRIDGE:-0}"
 mkdir -p "$(dirname "$SINGBOX_CONFIG_FILE")"
 
 username_line=""
@@ -85,6 +86,32 @@ JSON
     ;;
 esac
 
+extra_outbounds_json=""
+extra_route_rules_json=""
+if [ "$SOCKS_VIA_HTTP_BRIDGE" = "1" ]; then
+  extra_outbounds_json="$(cat <<JSON
+,
+    {
+      "type": "http",
+      "tag": "socks-via-http",
+      "server": "${LOCAL_HTTP_HOST}",
+      "server_port": ${LOCAL_HTTP_PORT},
+      "path": ""
+    }
+JSON
+)"
+  extra_route_rules_json="$(cat <<'JSON'
+,
+      {
+        "inbound": [
+          "in-socks"
+        ],
+        "outbound": "socks-via-http"
+      }
+JSON
+)"
+fi
+
 cat >"$SINGBOX_CONFIG_FILE" <<JSON
 {
   "log": {
@@ -106,7 +133,7 @@ cat >"$SINGBOX_CONFIG_FILE" <<JSON
     }
   ],
   "outbounds": [
-${primary_outbound_json},
+${primary_outbound_json}${extra_outbounds_json},
     {
       "type": "direct",
       "tag": "direct"
@@ -127,7 +154,7 @@ ${primary_outbound_json},
           "100.64.0.0/10"
         ],
         "outbound": "direct"
-      }
+      }${extra_route_rules_json}
     ],
     "final": "primary",
     "auto_detect_interface": true

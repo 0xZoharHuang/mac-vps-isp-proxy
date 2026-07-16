@@ -7,6 +7,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE="${DMIT_IPROYAL_ENV_FILE:-$HOME/.config/dmit-iproyal/env}"
 SHELL_ENV_FILE="${DMIT_IPROYAL_SHELL_ENV_FILE:-$HOME/.config/dmit-iproyal/shell_proxy.env}"
 ZSHRC_FILE="${DMIT_IPROYAL_ZSHRC_FILE:-$HOME/.zshrc}"
+ZPROFILE_FILE="${DMIT_IPROYAL_ZPROFILE_FILE:-$HOME/.zprofile}"
 ZSHENV_FILE="${DMIT_IPROYAL_ZSHENV_FILE:-$HOME/.zshenv}"
 
 TUNNEL_LABEL="com.zohar.dmit.iproyal.tunnel"
@@ -85,6 +86,7 @@ HTTPS_CONNECT_PROBE_URLS=(
 
 cli_proxy_mode="${CLI_PROXY_MODE:-http}"
 proxy_scope="${PROXY_SCOPE:-active}"
+system_socks_enable="${SYSTEM_SOCKS_ENABLE:-1}"
 tun_keep_proxy_core="${TUN_KEEP_PROXY_CORE:-1}"
 tun_keep_shell_env="${TUN_KEEP_SHELL_ENV:-1}"
 probe_connect_timeout="${PROBE_CONNECT_TIMEOUT:-3}"
@@ -383,10 +385,21 @@ remove_managed_block() {
 
 ensure_shell_hook() {
   mkdir -p "$(dirname "$SHELL_ENV_FILE")"
-  touch "$ZSHRC_FILE"
+  touch "$ZSHRC_FILE" "$ZPROFILE_FILE"
 
   remove_managed_block "$ZSHRC_FILE"
-  cat >>"$ZSHRC_FILE" <<EOF_HOOK
+  remove_managed_block "$ZPROFILE_FILE"
+
+  append_shell_hook "$ZPROFILE_FILE"
+  append_shell_hook "$ZSHRC_FILE"
+
+  remove_managed_block "$ZSHENV_FILE"
+}
+
+append_shell_hook() {
+  local file="$1"
+
+  cat >>"$file" <<EOF_HOOK
 
 # >>> dmit-iproyal proxy >>>
 _dmit_iproyal_apply_shell_state() {
@@ -414,8 +427,6 @@ fi
 _dmit_iproyal_apply_shell_state
 # <<< dmit-iproyal proxy <<<
 EOF_HOOK
-
-  remove_managed_block "$ZSHENV_FILE"
 }
 
 shell_http_proxy_url() {
@@ -1148,7 +1159,11 @@ proxy_on() {
     networksetup -setsecurewebproxy "$svc" "$LOCAL_HTTP_HOST" "$LOCAL_HTTP_PORT" off || true
     networksetup -setsecurewebproxystate "$svc" on || true
     networksetup -setsocksfirewallproxy "$svc" "$LOCAL_SOCKS_HOST" "$LOCAL_SOCKS_PORT" off || true
-    networksetup -setsocksfirewallproxystate "$svc" on || true
+    if [ "$system_socks_enable" = "1" ]; then
+      networksetup -setsocksfirewallproxystate "$svc" on || true
+    else
+      networksetup -setsocksfirewallproxystate "$svc" off || true
+    fi
     networksetup -setproxybypassdomains "$svc" "${bypass[@]}" || true
   done
 
@@ -1250,9 +1265,13 @@ service_proxy_points_to_stack() {
   [ "$https_enabled" = "Yes" ] || return 1
   [ "$https_server" = "$LOCAL_HTTP_HOST" ] || return 1
   [ "$https_port" = "$LOCAL_HTTP_PORT" ] || return 1
-  [ "$socks_enabled" = "Yes" ] || return 1
-  [ "$socks_server" = "$LOCAL_SOCKS_HOST" ] || return 1
-  [ "$socks_port" = "$LOCAL_SOCKS_PORT" ] || return 1
+  if [ "$system_socks_enable" = "1" ]; then
+    [ "$socks_enabled" = "Yes" ] || return 1
+    [ "$socks_server" = "$LOCAL_SOCKS_HOST" ] || return 1
+    [ "$socks_port" = "$LOCAL_SOCKS_PORT" ] || return 1
+  else
+    [ "$socks_enabled" != "Yes" ] || return 1
+  fi
 }
 
 service_proxy_points_to_surge() {
@@ -1313,6 +1332,18 @@ global_proxy_enabled_any() {
   [ "$h" = "1" ] || [ "$s" = "1" ] || [ "$x" = "1" ]
 }
 
+scoped_services_proxy_points_to_stack() {
+  local svc any=0
+
+  while IFS= read -r svc; do
+    [ -n "$svc" ] || continue
+    any=1
+    service_proxy_points_to_stack "$svc" || return 1
+  done < <(resolve_services)
+
+  [ "$any" = "1" ]
+}
+
 global_proxy_points_to_stack() {
   local h hs hp s ss sp x xs xp
   h="$(scutil_proxy_get HTTPEnable)"
@@ -1325,15 +1356,25 @@ global_proxy_points_to_stack() {
   xs="$(scutil_proxy_get SOCKSProxy)"
   xp="$(scutil_proxy_get SOCKSPort)"
 
-  [ "$h" = "1" ] || return 1
-  [ "$hs" = "$LOCAL_HTTP_HOST" ] || return 1
-  [ "$hp" = "$LOCAL_HTTP_PORT" ] || return 1
-  [ "$s" = "1" ] || return 1
-  [ "$ss" = "$LOCAL_HTTP_HOST" ] || return 1
-  [ "$sp" = "$LOCAL_HTTP_PORT" ] || return 1
-  [ "$x" = "1" ] || return 1
-  [ "$xs" = "$LOCAL_SOCKS_HOST" ] || return 1
-  [ "$xp" = "$LOCAL_SOCKS_PORT" ] || return 1
+  if [ "$h" = "1" ] && [ "$hs" = "$LOCAL_HTTP_HOST" ] && [ "$hp" = "$LOCAL_HTTP_PORT" ] && \
+     [ "$s" = "1" ] && [ "$ss" = "$LOCAL_HTTP_HOST" ] && [ "$sp" = "$LOCAL_HTTP_PORT" ]; then
+    if [ "$system_socks_enable" = "1" ] && { [ "$x" != "1" ] || [ "$xs" != "$LOCAL_SOCKS_HOST" ] || [ "$xp" != "$LOCAL_SOCKS_PORT" ]; }; then
+      return 1
+    fi
+    if [ "$system_socks_enable" != "1" ] && [ "$x" = "1" ]; then
+      return 1
+    fi
+    return 0
+  fi
+
+  case "$proxy_scope" in
+    active|primary|all)
+      scoped_services_proxy_points_to_stack
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 global_proxy_points_to_surge() {
@@ -1874,10 +1915,19 @@ verify_cli_apis() {
   if [ "$(proxy_core_running_value)" = "yes" ]; then
     local_http_openai="$(api_http_code_via_proxy "$local_http_proxy" "$openai_url")"
     local_http_anthropic="$(api_http_code_via_proxy "$local_http_proxy" "$anthropic_url")"
-    local_socks_openai="$(api_http_code_via_proxy "$local_socks_proxy" "$openai_url")"
-    local_socks_anthropic="$(api_http_code_via_proxy "$local_socks_proxy" "$anthropic_url")"
     echo "local_http_openai=$local_http_openai"
     echo "local_http_anthropic=$local_http_anthropic"
+
+    case "$cli_proxy_mode" in
+      socks|socks5|mixed)
+        local_socks_openai="$(api_http_code_via_proxy "$local_socks_proxy" "$openai_url")"
+        local_socks_anthropic="$(api_http_code_via_proxy "$local_socks_proxy" "$anthropic_url")"
+        ;;
+      *)
+        local_socks_openai="skip"
+        local_socks_anthropic="skip"
+        ;;
+    esac
     echo "local_socks_openai=$local_socks_openai"
     echo "local_socks_anthropic=$local_socks_anthropic"
   fi
@@ -1892,10 +1942,10 @@ verify_cli_apis() {
     echo "system_anthropic=skip"
   fi
 
-  if [ -n "${relay_openai:-}" ] && [ "$relay_openai" = "000" -o "$relay_anthropic" = "000" ]; then
+  if [ -n "${local_http_openai:-}" ] && [ "$local_http_openai" = "000" -o "$local_http_anthropic" = "000" ]; then
     return 1
   fi
-  if [ -n "${local_http_openai:-}" ] && [ "$local_http_openai" = "000" -o "$local_http_anthropic" = "000" -o "$local_socks_openai" = "000" -o "$local_socks_anthropic" = "000" ]; then
+  if [ -n "${local_socks_openai:-}" ] && [ "$local_socks_openai" != "skip" ] && [ "$local_socks_openai" = "000" -o "$local_socks_anthropic" = "000" ]; then
     return 1
   fi
   if [ -n "${system_openai:-}" ] && [ "$system_openai" != "skip" ] && [ "$system_openai" = "000" -o "$system_anthropic" = "000" ]; then
@@ -3016,7 +3066,11 @@ print_recent_error_summary() {
     file="$LOG_DIR/$label"
     echo "--$label"
     if [ -f "$file" ]; then
-      rg -n 'Too many open files|Connection reset by peer|Broken pipe|timed out|timeout|refused|failed|error|disconnect' "$file" | tail -n 5 || echo "clean"
+      if command -v rg >/dev/null 2>&1; then
+        rg -n 'Too many open files|Connection reset by peer|Broken pipe|timed out|timeout|refused|failed|error|disconnect' "$file" | tail -n 5 || echo "clean"
+      else
+        grep -En 'Too many open files|Connection reset by peer|Broken pipe|timed out|timeout|refused|failed|error|disconnect' "$file" | tail -n 5 || echo "clean"
+      fi
     else
       echo "missing"
     fi
