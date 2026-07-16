@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[ "$(id -u)" -eq 0 ] || { echo "Run with sudo." >&2; exit 1; }
+ACTION="${1:-}"
+STATE_DIR="/var/db/personalvpn-canary"
+PLIST="/Library/LaunchDaemons/local.personalvpn.daemon.plist"
+MARKER="/Library/Application Support/PersonalVPN/host-canary-approved"
+
+case "$ACTION" in
+  arm)
+    [ "${2:-}" = "--i-understand-network-will-change" ] || {
+      echo "Usage: sudo personalvpn-canary arm --i-understand-network-will-change [timeout-seconds]" >&2
+      exit 2
+    }
+    TIMEOUT="${3:-120}"
+    case "$TIMEOUT" in *[!0-9]*|'') echo "Timeout must be an integer." >&2; exit 2;; esac
+    [ "$TIMEOUT" -ge 30 ] || { echo "Timeout must be at least 30 seconds." >&2; exit 2; }
+    install -d -m 700 "$STATE_DIR"
+    cp "$PLIST" "$STATE_DIR/safe-daemon.plist"
+    chmod 600 "$STATE_DIR/safe-daemon.plist"
+
+    CONSOLE_USER="$(stat -f '%Su' /dev/console)"
+    CONSOLE_UID="$(id -u "$CONSOLE_USER")"
+    CONSOLE_HOME="$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory | awk '{print $2}')"
+    LEGACY_CTL="$CONSOLE_HOME/.local/bin/dmit-iproyal-proxyctl"
+    LEGACY_MODE="direct"
+    if [ -x "$LEGACY_CTL" ]; then
+      LEGACY_MODE="$(sudo -u "$CONSOLE_USER" "$LEGACY_CTL" mode 2>/dev/null | awk -F= '/^mode=/{print $2; exit}')"
+      case "$LEGACY_MODE" in stack-proxy|stack-tun|surge|direct) ;; *) LEGACY_MODE="direct";; esac
+    fi
+    cat >"$STATE_DIR/restore-old-stack" <<RESTORE
+#!/usr/bin/env bash
+set -euo pipefail
+CTL='$LEGACY_CTL'
+[ -x "\$CTL" ] || exit 0
+case '$LEGACY_MODE' in
+  stack-proxy) exec sudo -u '$CONSOLE_USER' "\$CTL" use-stack-proxy ;;
+  stack-tun) exec sudo -u '$CONSOLE_USER' "\$CTL" use-stack-tun ;;
+  surge) exec sudo -u '$CONSOLE_USER' "\$CTL" use-surge ;;
+  *) exec sudo -u '$CONSOLE_USER' "\$CTL" use-direct ;;
+esac
+RESTORE
+    chmod 700 "$STATE_DIR/restore-old-stack"
+
+    /usr/libexec/PlistBuddy -c 'Add :ProgramArguments:1 string --network-enabled' "$PLIST" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables dict' "$PLIST" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c 'Set :EnvironmentVariables:PERSONALVPN_ALLOW_HOST_NETWORK I_UNDERSTAND_THIS_CHANGES_ROUTES' "$PLIST" 2>/dev/null || \
+      /usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables:PERSONALVPN_ALLOW_HOST_NETWORK string I_UNDERSTAND_THIS_CHANGES_ROUTES' "$PLIST"
+    touch "$MARKER"
+    chmod 600 "$MARKER"
+    launchctl bootout system/local.personalvpn.daemon >/dev/null 2>&1 || true
+    launchctl bootstrap system "$PLIST"
+
+    if [ -x "$LEGACY_CTL" ]; then
+      sudo -u "$CONSOLE_USER" "$LEGACY_CTL" use-direct >/dev/null 2>&1 || true
+    fi
+    nohup /bin/sh -c "sleep $TIMEOUT; /usr/local/sbin/personalvpn-rescue" >"$STATE_DIR/timer.log" 2>&1 &
+    echo "$!" >"$STATE_DIR/timer.pid"
+    echo "Canary armed for $TIMEOUT seconds. Automatic rollback is active."
+    echo "Connect using the App, then run: sudo personalvpn-canary commit"
+    ;;
+  commit)
+    [ -f "$STATE_DIR/timer.pid" ] || { echo "No armed canary." >&2; exit 1; }
+    kill "$(cat "$STATE_DIR/timer.pid")" >/dev/null 2>&1 || true
+    rm -f "$STATE_DIR/timer.pid"
+    echo "Canary committed. Network-enabled daemon remains active."
+    ;;
+  rollback)
+    exec /usr/local/sbin/personalvpn-rescue
+    ;;
+  *)
+    echo "Usage: sudo personalvpn-canary {arm --i-understand-network-will-change [seconds]|commit|rollback}" >&2
+    exit 2
+    ;;
+esac

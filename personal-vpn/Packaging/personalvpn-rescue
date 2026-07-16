@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[ "$(id -u)" -eq 0 ] || { echo "Run with sudo: sudo personalvpn-rescue" >&2; exit 1; }
+STATE_DIR="/var/db/personalvpn-canary"
+PLIST="/Library/LaunchDaemons/local.personalvpn.daemon.plist"
+
+# Kill only the new product's pinned data-plane binary. Never match the legacy
+# Homebrew sing-box or the existing DMIT/IPRoyal LaunchAgents.
+launchctl bootout system/local.personalvpn.daemon >/dev/null 2>&1 || true
+pkill -TERM -f '^/usr/local/libexec/personalvpn/sing-box run ' >/dev/null 2>&1 || true
+sleep 1
+pkill -KILL -f '^/usr/local/libexec/personalvpn/sing-box run ' >/dev/null 2>&1 || true
+rm -f /var/run/personalvpn/personalvpnd.sock
+
+if [ -f "$STATE_DIR/safe-daemon.plist" ]; then
+  install -o root -g wheel -m 644 "$STATE_DIR/safe-daemon.plist" "$PLIST"
+  launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || true
+fi
+
+if [ -x "$STATE_DIR/restore-old-stack" ]; then
+  "$STATE_DIR/restore-old-stack" || true
+fi
+
+rm -f "/Library/Application Support/PersonalVPN/host-canary-approved"
+echo "Personal VPN data plane stopped. Network is Direct or restored to the captured legacy mode."

@@ -1,5 +1,11 @@
 # mac-vps-isp-proxy
 
+> A parallel product rewrite now lives in [`personal-vpn/`](personal-vpn/README.md).
+> It uses a native macOS App, a single authoritative daemon, sing-box SSH
+> detours, subscription nodes, and VM-first safety gates. The legacy stack below
+> remains unchanged and continues to be the active implementation until the new
+> product passes VM acceptance and an explicitly armed host canary.
+
 A macOS proxy stack that routes traffic through `local -> DMIT VPS (SSH relay) -> ISP proxy` with menu-bar mode switching (SwiftBar), system proxy support, and optional TUN mode.
 
 ## What This Solves

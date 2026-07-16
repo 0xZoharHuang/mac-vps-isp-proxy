@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "vpsEndpoints": [
+    {
+      "id": "primary-vps",
+      "name": "Primary VPS",
+      "host": "203.0.113.10",
+      "port": 443,
+      "user": "root",
+      "privateKeyPath": "/Users/you/.ssh/personalvpn_vps",
+      "hostKey": "ssh-ed25519 REPLACE_WITH_PINNED_HOST_KEY"
+    }
+  ],
+  "ispEndpoints": [
+    {
+      "id": "stable-isp",
+      "name": "Stable ISP",
+      "type": "socks",
+      "host": "198.51.100.20",
+      "port": 1080,
+      "username": "replace-me",
+      "password": "replace-me",
+      "expectedEgressIP": "198.51.100.30"
+    }
+  ],
+  "subscriptionSources": [],
+  "subscriptionNodes": [],
+  "stableSelection": null,
+  "subscriptionSelection": null
+}
