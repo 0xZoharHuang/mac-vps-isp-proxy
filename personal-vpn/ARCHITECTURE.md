@@ -1,5 +1,11 @@
 # Architecture
 
+The macOS data plane uses sing-box's gVisor TUN stack. The command-line system
+stack can install routes without delivering packets on some macOS 15.6 hosts;
+gVisor is therefore an explicit compatibility invariant. The compiler also
+emits `/32` or `/128` exclusions for fixed tunnel entry points to prevent
+recursive capture of the SSH and ISP transports.
+
 ## Authority and data flow
 
 `personalvpnd` is the only component allowed to own desired mode, connection

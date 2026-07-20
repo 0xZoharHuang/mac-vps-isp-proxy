@@ -1,7 +1,10 @@
 import Darwin
 import Foundation
 import Network
+import OSLog
 import PersonalVPNCore
+
+private let logger = Logger(subsystem: "local.personalvpn", category: "daemon")
 
 private struct DaemonOptions {
     var socketPath = "/var/run/personalvpn/personalvpnd.sock"
@@ -56,6 +59,7 @@ private actor VPNController {
     private var configuration: ProductConfiguration
     private var snapshot: ConnectionSnapshot
     private var engine: Process?
+    private var engineLogHandle: FileHandle?
     private var healthTask: Task<Void, Never>?
     private var activeConfigData: Data?
     private var activeExpectedEgressIP: String?
@@ -66,11 +70,9 @@ private actor VPNController {
         self.configStore = AtomicJSONStore(url: URL(fileURLWithPath: options.stateDirectory).appendingPathComponent("config.json"))
         self.stateStore = AtomicJSONStore(url: URL(fileURLWithPath: options.stateDirectory).appendingPathComponent("state.json"))
         self.configuration = try configStore.load(default: ProductConfiguration())
-        self.snapshot = try stateStore.load(default: ConnectionSnapshot(networkEnabled: options.networkEnabled))
-        self.snapshot.networkEnabled = options.networkEnabled
-        if !options.networkEnabled {
-            self.snapshot = ConnectionSnapshot(networkEnabled: false)
-        }
+        _ = try stateStore.load(default: ConnectionSnapshot(networkEnabled: options.networkEnabled))
+        self.snapshot = ConnectionSnapshot(networkEnabled: options.networkEnabled)
+        try stateStore.save(self.snapshot)
     }
 
     func handle(_ request: APIRequest) async -> APIResponse {
@@ -141,6 +143,8 @@ private actor VPNController {
             case "speedtest.run":
                 let result = try await runDownloadSpeedTest()
                 return APIResponse(id: request.id, ok: true, message: String(format: "download_mbps=%.2f bytes=%d", result.mbps, result.bytes))
+            case "doctor.run":
+                return APIResponse(id: request.id, ok: true, message: try diagnosticReport())
             case "connect.direct":
                 try stopEngine(errorReason: nil)
                 return APIResponse(id: request.id, ok: true, snapshot: snapshot)
@@ -199,13 +203,15 @@ private actor VPNController {
         check.waitUntilExit()
         guard check.terminationStatus == 0 else { throw PersonalVPNError.engineFailure("sing-box check failed") }
 
-        if let engine, engine.isRunning { engine.terminate(); engine.waitUntilExit() }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: options.singBoxPath)
-        process.arguments = ["run", "-c", configURL.path]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
+        if let engine, engine.isRunning, !ProcessTerminator.stop(engine) {
+            throw PersonalVPNError.engineFailure("previous engine did not stop")
+        }
+        let process: Process
+        do { process = try spawnEngine(configURL: configURL) }
+        catch {
+            try? stopEngine(errorReason: "engine failed to start")
+            throw error
+        }
         engine = process
         activeConfigData = configData
         activeExpectedEgressIP = expectedEgressIP
@@ -219,11 +225,13 @@ private actor VPNController {
         healthTask = nil
         snapshot = ConnectionStateMachine.reduce(snapshot, event: .requestDirect)
         try stateStore.save(snapshot)
-        if let engine, engine.isRunning {
-            engine.terminate()
-            engine.waitUntilExit()
+        if let engine, engine.isRunning, !ProcessTerminator.stop(engine) {
+            throw PersonalVPNError.engineFailure("engine did not stop")
         }
         engine = nil
+        try? engineLogHandle?.close()
+        engineLogHandle = nil
+        removeEnginePID()
         activeConfigData = nil
         activeExpectedEgressIP = nil
         snapshot = ConnectionStateMachine.reduce(snapshot, event: errorReason.map { .retriesExhausted(reason: $0) } ?? .engineStopped)
@@ -235,13 +243,13 @@ private actor VPNController {
         while !Task.isCancelled, snapshot.mode != .direct {
             do {
                 try await Task.sleep(for: .seconds(3))
+                if engine?.isRunning != true {
+                    consecutiveFailures = 3
+                    throw PersonalVPNError.engineFailure("engine exited: \(engineFailureSummary())")
+                }
                 let result = try await probeEgress()
                 if let expected = activeExpectedEgressIP, result.ip != expected {
-                    snapshot = ConnectionStateMachine.reduce(snapshot, event: .probeFailed(reason: "egress-ip-mismatch expected=\(expected) actual=\(result.ip)"))
-                    try? stateStore.save(snapshot)
-                    consecutiveFailures = 0
-                    try await Task.sleep(for: .seconds(12))
-                    continue
+                    throw PersonalVPNError.engineFailure("egress-ip-mismatch expected=\(expected) actual=\(result.ip)")
                 }
                 snapshot = ConnectionStateMachine.reduce(snapshot, event: .probeSucceeded(ip: result.ip, latencyMilliseconds: result.latency))
                 try? stateStore.save(snapshot)
@@ -296,13 +304,10 @@ private actor VPNController {
     private func launchValidatedEngine(configData: Data) throws {
         let runtime = URL(fileURLWithPath: options.stateDirectory).appendingPathComponent("runtime")
         let configURL = runtime.appendingPathComponent("sing-box.json")
-        if let engine, engine.isRunning { engine.terminate(); engine.waitUntilExit() }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: options.singBoxPath)
-        process.arguments = ["run", "-c", configURL.path]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
+        if let engine, engine.isRunning, !ProcessTerminator.stop(engine) {
+            throw PersonalVPNError.engineFailure("engine did not stop during reconnect")
+        }
+        let process = try spawnEngine(configURL: configURL)
         engine = process
     }
 
@@ -404,9 +409,76 @@ private actor VPNController {
         let seconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
         return (Double(data.count) * 8 / max(seconds, 0.001) / 1_000_000, data.count)
     }
+
+    private func diagnosticReport() throws -> String {
+        let report: [String: Any] = [
+            "schema_version": configuration.schemaVersion,
+            "network_enabled": snapshot.networkEnabled,
+            "mode": snapshot.mode.rawValue,
+            "phase": snapshot.phase.rawValue,
+            "engine_running": engine?.isRunning == true,
+            "engine_failure": snapshot.failureReason ?? "none",
+            "sing_box_executable": FileManager.default.isExecutableFile(atPath: options.singBoxPath),
+            "vps_count": configuration.vpsEndpoints.count,
+            "isp_count": configuration.ispEndpoints.count,
+            "subscription_source_count": configuration.subscriptionSources.count,
+            "subscription_node_count": configuration.subscriptionNodes.count,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private var enginePIDURL: URL {
+        URL(fileURLWithPath: options.stateDirectory).appendingPathComponent("runtime/engine.pid")
+    }
+
+    private func writeEnginePID(_ pid: Int32) throws {
+        try Data("\(pid)\n".utf8).write(to: enginePIDURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: enginePIDURL.path)
+    }
+
+    private func removeEnginePID() {
+        try? FileManager.default.removeItem(at: enginePIDURL)
+    }
+
+    private func spawnEngine(configURL: URL) throws -> Process {
+        try? engineLogHandle?.close()
+        engineLogHandle = nil
+        let logURL = configURL.deletingLastPathComponent().appendingPathComponent("engine.log")
+        try Data().write(to: logURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logURL.path)
+        let logHandle = try FileHandle(forWritingTo: logURL)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: options.singBoxPath)
+        process.arguments = ["run", "-c", configURL.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = logHandle
+        do { try process.run() }
+        catch { try? logHandle.close(); throw error }
+        usleep(400_000)
+        guard process.isRunning else {
+            process.waitUntilExit()
+            try? logHandle.close()
+            throw PersonalVPNError.engineFailure("sing-box exited during startup: \(engineFailureSummary())")
+        }
+        engineLogHandle = logHandle
+        try writeEnginePID(process.processIdentifier)
+        return process
+    }
+
+    private func engineFailureSummary() -> String {
+        let logURL = URL(fileURLWithPath: options.stateDirectory).appendingPathComponent("runtime/engine.log")
+        guard let data = try? Data(contentsOf: logURL), !data.isEmpty else { return "none" }
+        let lines = String(decoding: data.suffix(8_000), as: UTF8.self).split(separator: "\n")
+        guard let failure = lines.last(where: { $0.contains("ERROR") || $0.contains("FATAL") }) else { return "none" }
+        let plain = String(failure).replacingOccurrences(
+            of: "\u{001B}\\[[0-9;]*m", with: "", options: .regularExpression
+        )
+        return Redactor.redact(plain)
+    }
 }
 
-private final class UnixSocketServer {
+private final class UnixSocketServer: @unchecked Sendable {
     private let path: String
     private let ownerUID: uid_t
     private var descriptor: Int32 = -1
@@ -416,7 +488,8 @@ private final class UnixSocketServer {
 
     func start() throws {
         let directory = URL(fileURLWithPath: path).deletingLastPathComponent().path
-        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o711])
+        try FileManager.default.setAttributes([.posixPermissions: 0o711], ofItemAtPath: directory)
         unlink(path)
         descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw PersonalVPNError.apiFailure("socket failed") }
@@ -436,7 +509,16 @@ private final class UnixSocketServer {
         chown(path, ownerUID, gid_t.max)
     }
 
-    func nextRequest() throws -> (Int32, APIRequest) {
+    func nextClient() async throws -> Int32 {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                do { continuation.resume(returning: try self.acceptClient()) }
+                catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    private func acceptClient() throws -> Int32 {
         let client = Darwin.accept(descriptor, nil, nil)
         guard client >= 0 else { throw PersonalVPNError.apiFailure("accept failed") }
         var peerUID: uid_t = 0
@@ -445,6 +527,10 @@ private final class UnixSocketServer {
             Darwin.close(client)
             throw PersonalVPNError.apiFailure("peer UID is not authorized")
         }
+        return client
+    }
+
+    func request(from client: Int32) throws -> APIRequest {
         var data = Data()
         var byte: UInt8 = 0
         while data.count < 2_000_000 {
@@ -453,8 +539,7 @@ private final class UnixSocketServer {
             if count == 0 || byte == 0x0A { break }
             data.append(byte)
         }
-        do { return (client, try JSONDecoder.productDecoder.decode(APIRequest.self, from: data)) }
-        catch { Darwin.close(client); throw error }
+        return try JSONDecoder.productDecoder.decode(APIRequest.self, from: data)
     }
 
     func respond(_ response: APIResponse, to client: Int32) {
@@ -465,16 +550,34 @@ private final class UnixSocketServer {
     }
 }
 
+private func reconcileStaleEngine(options: DaemonOptions) {
+    let pidURL = URL(fileURLWithPath: options.stateDirectory).appendingPathComponent("runtime/engine.pid")
+    defer { try? FileManager.default.removeItem(at: pidURL) }
+    guard let raw = try? String(contentsOf: pidURL, encoding: .utf8),
+          let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 1 else { return }
+    var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+    let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+    guard length > 0 else { return }
+    let executablePath = buffer.prefix(Int(length)).map { UInt8(bitPattern: $0) }
+    guard String(decoding: executablePath, as: UTF8.self) == options.singBoxPath else { return }
+    kill(pid, SIGTERM)
+    let deadline = Date().addingTimeInterval(2)
+    while kill(pid, 0) == 0, Date() < deadline { usleep(50_000) }
+    if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+}
+
 @main
 private enum PersonalVPNDaemonMain {
     static func main() async throws {
         let options = DaemonOptions.parse(Array(CommandLine.arguments.dropFirst()))
+        reconcileStaleEngine(options: options)
         let controller = try VPNController(options: options)
         await controller.startBackgroundTasks()
         let server = UnixSocketServer(path: options.socketPath, ownerUID: options.ownerUID)
         try server.start()
         signal(SIGTERM, SIG_IGN)
         signal(SIGINT, SIG_IGN)
+        signal(SIGPIPE, SIG_IGN)
         let terminate = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
         let interrupt = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
         let shutdown: @Sendable () -> Void = {
@@ -487,15 +590,24 @@ private enum PersonalVPNDaemonMain {
         interrupt.setEventHandler(handler: shutdown)
         terminate.resume()
         interrupt.resume()
-        FileHandle.standardError.write(Data("personalvpnd ready network_enabled=\(options.networkEnabled)\n".utf8))
+        logger.notice("personalvpnd ready network_enabled=\(options.networkEnabled, privacy: .public)")
         while true {
             do {
-                let (client, request) = try server.nextRequest()
-                let response = await controller.handle(request)
-                server.respond(response, to: client)
+                let client = try await server.nextClient()
+                Task {
+                    do {
+                        let request = try server.request(from: client)
+                        let response = await controller.handle(request)
+                        server.respond(response, to: client)
+                    } catch {
+                        Darwin.close(client)
+                        let message = Redactor.redact(error.localizedDescription)
+                        logger.error("request_error=\(message, privacy: .public)")
+                    }
+                }
             } catch {
                 let message = Redactor.redact(error.localizedDescription)
-                FileHandle.standardError.write(Data("personalvpnd request_error=\(message)\n".utf8))
+                logger.error("accept_error=\(message, privacy: .public)")
             }
         }
     }

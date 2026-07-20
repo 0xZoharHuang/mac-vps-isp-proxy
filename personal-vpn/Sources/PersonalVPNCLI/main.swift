@@ -13,6 +13,7 @@ private func usage() -> Never {
       refresh <source-id>
       probe <node-id>
       speedtest
+      doctor
     """)
     exit(2)
 }
@@ -38,11 +39,13 @@ case "config-import" where arguments.count == 2:
 case "refresh" where arguments.count == 2: request = APIRequest(method: "subscription.refresh", sourceID: arguments[1])
 case "probe" where arguments.count == 2: request = APIRequest(method: "probe.run", nodeID: arguments[1])
 case "speedtest": request = APIRequest(method: "speedtest.run")
+case "doctor": request = APIRequest(method: "doctor.run")
 default: usage()
 }
 
 do {
-    let response = try UnixSocketClient(socketPath: socketPath).send(request)
+    let longRunning = ["speedtest.run", "subscription.refresh"].contains(request.method)
+    let response = try UnixSocketClient(socketPath: socketPath, timeoutSeconds: longRunning ? 30 : 5).send(request)
     let data = try JSONEncoder.productEncoder.encode(response)
     print(String(decoding: data, as: UTF8.self))
     if !response.ok { exit(1) }

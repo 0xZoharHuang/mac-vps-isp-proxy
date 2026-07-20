@@ -5,6 +5,14 @@ set -euo pipefail
 STATE_DIR="/var/db/personalvpn-canary"
 PLIST="/Library/LaunchDaemons/local.personalvpn.daemon.plist"
 
+if [ -f "$STATE_DIR/timer.pid" ]; then
+  TIMER_PID="$(cat "$STATE_DIR/timer.pid")"
+  rm -f "$STATE_DIR/timer.pid"
+  if [ "$TIMER_PID" != "$PPID" ]; then
+    kill "$TIMER_PID" >/dev/null 2>&1 || true
+  fi
+fi
+
 # Kill only the new product's pinned data-plane binary. Never match the legacy
 # Homebrew sing-box or the existing DMIT/IPRoyal LaunchAgents.
 launchctl bootout system/local.personalvpn.daemon >/dev/null 2>&1 || true
@@ -15,7 +23,11 @@ rm -f /var/run/personalvpn/personalvpnd.sock
 
 if [ -f "$STATE_DIR/safe-daemon.plist" ]; then
   install -o root -g wheel -m 644 "$STATE_DIR/safe-daemon.plist" "$PLIST"
-  launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || true
+  sleep 1
+  launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || {
+    sleep 2
+    launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || true
+  }
 fi
 
 if [ -x "$STATE_DIR/restore-old-stack" ]; then

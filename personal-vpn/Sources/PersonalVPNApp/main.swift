@@ -8,58 +8,67 @@ private final class VPNViewModel: ObservableObject {
     @Published var configuration = ProductConfiguration()
     private let client = UnixSocketClient()
     private var timer: Timer?
+    private var started = false
 
     func start() {
+        guard !started else { return }
+        started = true
         refresh()
         refreshConfiguration()
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+            Task { @MainActor [weak self] in self?.refresh() }
         }
     }
 
     func refresh() {
-        do {
-            let response = try client.send(APIRequest(method: "status.get"))
-            if let value = response.snapshot { snapshot = value }
-            errorMessage = response.ok ? nil : response.message
-        } catch {
-            errorMessage = "Daemon unavailable"
+        perform(APIRequest(method: "status.get")) { response in
+            if let value = response.snapshot { self.snapshot = value }
         }
     }
 
     func direct() {
-        do {
-            let response = try client.send(APIRequest(method: "connect.direct"))
-            if let value = response.snapshot { snapshot = value }
-            errorMessage = response.ok ? nil : response.message
-        } catch { errorMessage = error.localizedDescription }
+        perform(APIRequest(method: "connect.direct")) { response in
+            if let value = response.snapshot { self.snapshot = value }
+        }
     }
 
     func refreshConfiguration() {
-        do {
-            let response = try client.send(APIRequest(method: "config.get"))
-            if let value = response.configuration { configuration = value }
-        } catch { errorMessage = error.localizedDescription }
+        perform(APIRequest(method: "config.get")) { response in
+            if let value = response.configuration { self.configuration = value }
+        }
     }
 
     func connectStable(vpsID: String, ispID: String) { perform(APIRequest(method: "connect.stable", vpsID: vpsID, ispID: ispID)) }
     func connectSubscription(sourceID: String, nodeID: String) { perform(APIRequest(method: "connect.subscription", sourceID: sourceID, nodeID: nodeID)) }
-    func refreshSubscription(sourceID: String) { perform(APIRequest(method: "subscription.refresh", sourceID: sourceID)); refreshConfiguration() }
+    func refreshSubscription(sourceID: String) {
+        perform(APIRequest(method: "subscription.refresh", sourceID: sourceID), timeoutSeconds: 30) { response in
+            if let value = response.configuration { self.configuration = value }
+        }
+    }
 
-    private func perform(_ request: APIRequest) {
-        do {
-            let response = try client.send(request)
-            if let value = response.snapshot { snapshot = value }
-            errorMessage = response.ok ? nil : response.message
-        } catch { errorMessage = error.localizedDescription }
+    private func perform(_ request: APIRequest, timeoutSeconds: Int = 5, update: (@MainActor (APIResponse) -> Void)? = nil) {
+        let socketPath = client.socketPath
+        Task {
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { try UnixSocketClient(socketPath: socketPath, timeoutSeconds: timeoutSeconds).send(request) }
+            }.value
+            switch result {
+            case .success(let response):
+                update?(response)
+                if let value = response.snapshot { snapshot = value }
+                errorMessage = response.ok ? nil : response.message
+            case .failure(let error):
+                errorMessage = request.method == "status.get" ? "Daemon unavailable" : error.localizedDescription
+            }
+        }
     }
 
     func upsert<T: Encodable>(_ value: T, method: String) {
         do {
             let payload = try JSONEncoder.productEncoder.encode(value).base64EncodedString()
-            let response = try client.send(APIRequest(method: method, payload: payload))
-            if let value = response.configuration { configuration = value }
-            errorMessage = response.ok ? nil : response.message
+            perform(APIRequest(method: method, payload: payload)) { response in
+                if let value = response.configuration { self.configuration = value }
+            }
         } catch { errorMessage = error.localizedDescription }
     }
 }

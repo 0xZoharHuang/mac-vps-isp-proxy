@@ -16,6 +16,7 @@ case "$ACTION" in
     TIMEOUT="${3:-120}"
     case "$TIMEOUT" in *[!0-9]*|'') echo "Timeout must be an integer." >&2; exit 2;; esac
     [ "$TIMEOUT" -ge 30 ] || { echo "Timeout must be at least 30 seconds." >&2; exit 2; }
+    [ ! -f "$STATE_DIR/timer.pid" ] || { echo "A canary is already armed; roll it back first." >&2; exit 1; }
     install -d -m 700 "$STATE_DIR"
     cp "$PLIST" "$STATE_DIR/safe-daemon.plist"
     chmod 600 "$STATE_DIR/safe-daemon.plist"
@@ -47,16 +48,31 @@ RESTORE
     /usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables dict' "$PLIST" 2>/dev/null || true
     /usr/libexec/PlistBuddy -c 'Set :EnvironmentVariables:PERSONALVPN_ALLOW_HOST_NETWORK I_UNDERSTAND_THIS_CHANGES_ROUTES' "$PLIST" 2>/dev/null || \
       /usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables:PERSONALVPN_ALLOW_HOST_NETWORK string I_UNDERSTAND_THIS_CHANGES_ROUTES' "$PLIST"
+    nohup /bin/sh -c "sleep $TIMEOUT; /usr/local/sbin/personalvpn-rescue" >"$STATE_DIR/timer.log" 2>&1 &
+    echo "$!" >"$STATE_DIR/timer.pid"
     touch "$MARKER"
     chmod 600 "$MARKER"
     launchctl bootout system/local.personalvpn.daemon >/dev/null 2>&1 || true
-    launchctl bootstrap system "$PLIST"
+    sleep 1
+    if ! launchctl bootstrap system "$PLIST"; then
+      echo "Network-enabled daemon failed to load; restoring Direct immediately." >&2
+      /usr/local/sbin/personalvpn-rescue
+      exit 1
+    fi
+    READY=0
+    for _ in $(seq 1 50); do
+      if /usr/local/bin/personalvpnctl status >/dev/null 2>&1; then READY=1; break; fi
+      sleep 0.1
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "Network-enabled daemon did not become ready; restoring Direct immediately." >&2
+      /usr/local/sbin/personalvpn-rescue
+      exit 1
+    fi
 
     if [ -x "$LEGACY_CTL" ]; then
       sudo -u "$CONSOLE_USER" "$LEGACY_CTL" use-direct >/dev/null 2>&1 || true
     fi
-    nohup /bin/sh -c "sleep $TIMEOUT; /usr/local/sbin/personalvpn-rescue" >"$STATE_DIR/timer.log" 2>&1 &
-    echo "$!" >"$STATE_DIR/timer.pid"
     echo "Canary armed for $TIMEOUT seconds. Automatic rollback is active."
     echo "Connect using the App, then run: sudo personalvpn-canary commit"
     ;;

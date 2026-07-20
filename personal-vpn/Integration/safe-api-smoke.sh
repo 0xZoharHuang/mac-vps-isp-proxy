@@ -13,11 +13,12 @@ swift build --package-path "$ROOT" >/dev/null
 DAEMON_PID=$!
 trap 'kill "$DAEMON_PID" >/dev/null 2>&1 || true' EXIT INT TERM
 
-for _ in $(seq 1 50); do
+for _ in $(seq 1 100); do
   [ -S "$SOCKET" ] && break
   sleep 0.05
 done
 [ -S "$SOCKET" ] || { echo "daemon did not create its development socket" >&2; exit 1; }
+[ "$(stat -f '%Lp' "$RUN_DIR")" = "711" ] || { echo "socket directory is not traversable" >&2; exit 1; }
 
 STATUS="$("$CTL" --socket "$SOCKET" status)"
 printf '%s\n' "$STATUS" | grep -q '"networkEnabled" : false'
@@ -30,6 +31,15 @@ if "$CTL" --socket "$SOCKET" stable primary-vps stable-isp >"$RUN_DIR/connect.ou
 fi
 grep -q 'Safety gate denied' "$RUN_DIR/connect.out"
 "$CTL" --socket "$SOCKET" direct >/dev/null
+"$CTL" --socket "$SOCKET" doctor | grep -q 'sing_box_executable'
+
+# A slow authorized client must not monopolize accept() and block Direct/status.
+ruby -rsocket -e 'socket = UNIXSocket.new(ARGV[0]); socket.write("{"); sleep 2' "$SOCKET" &
+SLOW_CLIENT_PID=$!
+sleep 0.1
+"$CTL" --socket "$SOCKET" status >/dev/null
+kill "$SLOW_CLIENT_PID" >/dev/null 2>&1 || true
+wait "$SLOW_CLIENT_PID" >/dev/null 2>&1 || true
 
 # A malformed client must be isolated to that connection and must not crash the
 # authoritative daemon.

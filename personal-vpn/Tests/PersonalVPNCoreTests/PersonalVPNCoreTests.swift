@@ -2,6 +2,16 @@ import Foundation
 import Testing
 @testable import PersonalVPNCore
 
+@Test func processTerminationIsBounded() throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+    process.arguments = ["30"]
+    try process.run()
+    let started = Date()
+    #expect(ProcessTerminator.stop(process, graceSeconds: 0.1))
+    #expect(Date().timeIntervalSince(started) < 2)
+}
+
 @Test func parsesBase64VMessSubscriptionAndDeduplicates() throws {
     let payload: [String: Any] = [
         "ps": "Tokyo", "add": "example.com", "port": "443", "id": "95a7457b-391c-43b7-8476-6415ed805fc9",
@@ -24,14 +34,23 @@ import Testing
 }
 
 @Test func stableConfigUsesSSHDetourAndKeepsExpectedExitSeparate() throws {
-    let vps = VPSEndpoint(id: "vps", name: "VPS", host: "vps.example.com", port: 443, privateKeyPath: "/tmp/key", hostKey: "ssh-ed25519 AAAATEST")
-    let isp = ISPEndpoint(id: "isp", name: "ISP", type: .socks, host: "isp.example.com", port: 1080, username: "user\"name", password: "p\\ass", expectedEgressIP: "203.0.113.8")
+    let vps = VPSEndpoint(id: "vps", name: "VPS", host: "203.0.113.10", port: 443, privateKeyPath: "/tmp/key", hostKey: "ssh-ed25519 AAAATEST\necdsa-sha2-nistp256 AAAAOTHER")
+    let isp = ISPEndpoint(id: "isp", name: "ISP", type: .socks, host: "198.51.100.20", port: 1080, username: "user\"name", password: "p\\ass", expectedEgressIP: "203.0.113.8")
     let data = try SingBoxConfigurationCompiler().compileStable(vps: vps, isp: isp)
     let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
     let outbounds = try #require(object["outbounds"] as? [[String: Any]])
     #expect(outbounds[0]["detour"] as? String == "stable-vps")
     #expect(outbounds[0]["password"] as? String == "p\\ass")
+    #expect((outbounds[1]["host_key"] as? [String])?.count == 2)
+    let route = try #require(object["route"] as? [String: Any])
+    let rules = try #require(route["rules"] as? [[String: Any]])
+    #expect(rules.contains { $0["network"] as? String == "udp" && $0["action"] as? String == "reject" })
+    let inbound = try #require((object["inbounds"] as? [[String: Any]])?.first)
+    #expect(inbound["stack"] as? String == "gvisor")
+    #expect((inbound["route_exclude_address"] as? [String])?.contains("203.0.113.10/32") == true)
+    #expect((inbound["route_exclude_address"] as? [String])?.contains("198.51.100.20/32") == true)
     #expect(!String(decoding: data, as: UTF8.self).contains("203.0.113.8"))
+    #expect(!String(decoding: data, as: UTF8.self).contains("cache.db"))
 }
 
 @Test func VMessConfigSupportsWebSocketTLS() throws {

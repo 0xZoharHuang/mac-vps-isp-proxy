@@ -34,6 +34,11 @@ The stable route is generated as:
 TUN → ISP SOCKS/HTTP outbound → sing-box SSH detour → VPS → ISP → Internet
 ```
 
+On macOS the TUN uses the bundled gVisor userspace stack. Fixed VPS and ISP
+entry IPs are excluded from TUN routes so the tunnel cannot capture its own
+transport. UDP is rejected after DNS hijacking because the SSH detour is
+TCP-only; clients then fall back to TCP without leaking UDP directly.
+
 The subscription route supports Base64 lists of `vmess://` entries. VMess TCP
 and WebSocket transports are supported in this first implementation.
 
@@ -61,10 +66,14 @@ socket tests remain available.
 ## Configuration
 
 The settings window can add VPS, ISP, and standard-HTTPS subscription sources.
+Daemon calls run away from the SwiftUI main actor so a slow operation cannot
+freeze the menu. The menu app starts at login, while every daemon restart
+reconciles to Direct rather than claiming a stale connection.
 The CLI can import the full versioned JSON format:
 
 ```bash
 personalvpnctl config-import ./config.json
+personalvpnctl doctor
 ```
 
 Start from `config.example.json`. Never commit a populated configuration.

@@ -6,12 +6,14 @@ public struct SingBoxConfigurationCompiler: Sendable {
         public var mtu: Int
         public var strictRoute: Bool
         public var logLevel: String
+        public var stack: String
 
-        public init(tunAddress: String = "172.31.251.1/30", mtu: Int = 1_408, strictRoute: Bool = true, logLevel: String = "info") {
+        public init(tunAddress: String = "172.31.251.1/30", mtu: Int = 1_408, strictRoute: Bool = true, logLevel: String = "info", stack: String = "gvisor") {
             self.tunAddress = tunAddress
             self.mtu = mtu
             self.strictRoute = strictRoute
             self.logLevel = logLevel
+            self.stack = stack
         }
     }
 
@@ -19,9 +21,10 @@ public struct SingBoxConfigurationCompiler: Sendable {
 
     public func compileStable(vps: VPSEndpoint, isp: ISPEndpoint, options: Options = .init()) throws -> Data {
         try validate(vps: vps, isp: isp)
+        let hostKeys = vps.hostKey.split(whereSeparator: \.isNewline).map(String.init)
         let ssh: [String: Any] = [
             "type": "ssh", "tag": "stable-vps", "server": vps.host, "server_port": vps.port,
-            "user": vps.user, "private_key_path": vps.privateKeyPath, "host_key": [vps.hostKey],
+            "user": vps.user, "private_key_path": vps.privateKeyPath, "host_key": hostKeys,
             "connect_timeout": "8s",
         ]
         var upstream: [String: Any] = [
@@ -31,7 +34,7 @@ public struct SingBoxConfigurationCompiler: Sendable {
         if !isp.username.isEmpty { upstream["username"] = isp.username }
         if !isp.password.isEmpty { upstream["password"] = isp.password }
         if isp.type == .socks { upstream["version"] = "5" }
-        return try serialize(outbounds: [upstream, ssh, directOutbound()], final: "selected", exclusions: [vps.host])
+        return try serialize(outbounds: [upstream, ssh, directOutbound()], final: "selected", exclusions: [vps.host, isp.host], options: options)
     }
 
     public func compileSubscription(node: VMessNode, options: Options = .init()) throws -> Data {
@@ -72,7 +75,17 @@ public struct SingBoxConfigurationCompiler: Sendable {
     }
 
     private func serialize(outbounds: [[String: Any]], final: String, exclusions: [String], options: Options = .init()) throws -> Data {
-        let routeExclusions = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"]
+        let privateExclusions = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"]
+        let endpointExclusions = exclusions.compactMap(normalizedRouteExclusion)
+        let routeExclusions = privateExclusions + endpointExclusions
+        var routeRules: [[String: Any]] = [
+            ["protocol": "dns", "action": "hijack-dns"],
+            ["network": "udp", "action": "reject"],
+        ]
+        if !endpointExclusions.isEmpty {
+            routeRules.append(["ip_cidr": endpointExclusions, "outbound": "direct"])
+        }
+        routeRules.append(["ip_is_private": true, "outbound": "direct"])
         let config: [String: Any] = [
             "log": ["level": options.logLevel, "timestamp": true],
             "dns": [
@@ -87,17 +100,14 @@ public struct SingBoxConfigurationCompiler: Sendable {
             ],
             "inbounds": [[
                 "type": "tun", "tag": "in-tun", "address": [options.tunAddress], "mtu": options.mtu,
-                "auto_route": true, "strict_route": options.strictRoute, "route_exclude_address": routeExclusions,
+                "auto_route": true, "strict_route": options.strictRoute, "stack": options.stack, "sniff": true,
+                "route_exclude_address": routeExclusions,
             ]],
             "outbounds": outbounds,
             "route": [
-                "rules": [
-                    ["protocol": "dns", "action": "hijack-dns"],
-                    ["ip_is_private": true, "outbound": "direct"],
-                ],
+                "rules": routeRules,
                 "final": final, "auto_detect_interface": true, "default_domain_resolver": "bootstrap",
             ],
-            "experimental": ["cache_file": ["enabled": true]],
         ]
         guard JSONSerialization.isValidJSONObject(config) else {
             throw PersonalVPNError.invalidConfiguration("Generated sing-box object is not valid JSON")
@@ -106,4 +116,14 @@ public struct SingBoxConfigurationCompiler: Sendable {
     }
 
     private func directOutbound() -> [String: Any] { ["type": "direct", "tag": "direct"] }
+
+    private func normalizedRouteExclusion(_ host: String) -> String? {
+        if host.contains("/") { return host }
+        let octets = host.split(separator: ".")
+        if octets.count == 4, octets.allSatisfy({ Int($0).map { (0...255).contains($0) } == true }) {
+            return "\(host)/32"
+        }
+        if host.contains(":") { return "\(host)/128" }
+        return nil
+    }
 }
