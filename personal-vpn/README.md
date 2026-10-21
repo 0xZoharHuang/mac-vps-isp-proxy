@@ -1,3 +1,10 @@
+> Publication status (2026-10-21): historical/research implementation, not a
+> production-certified client. Surge, FlClash and self-built PersonalVPN may
+> coexist as alternatives, but only one should own default traffic and DNS.
+> See the [current cross-client guide](../docs/stable-isp/architecture-and-clients.md).
+> Older installation, SSH transport and automatic recovery descriptions below
+> are historical behavior, not recommendations for the current deployment.
+
 # Personal VPN for macOS
 
 `personal-vpn/` is the parallel, product-oriented replacement for the legacy

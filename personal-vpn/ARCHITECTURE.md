@@ -1,3 +1,7 @@
+> Publication status (2026-10-21): historical/research architecture. See the
+> [current cross-client guide](../docs/stable-isp/architecture-and-clients.md).
+> This document is not proof of a production-accepted native VPN release.
+
 # Architecture
 
 The macOS data plane uses sing-box's gVisor TUN stack. The command-line system

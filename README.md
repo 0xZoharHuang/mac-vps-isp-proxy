@@ -1,169 +1,46 @@
-# mac-vps-isp-proxy
+# VPS → 固定 ISP 出口：跨客户端接入参考
 
-> A parallel product rewrite now lives in [`personal-vpn/`](personal-vpn/README.md).
-> It uses a native macOS App, a single authoritative daemon, sing-box SSH
-> detours, subscription nodes, and VM-first safety gates. The legacy stack below
-> remains unchanged and continues to be the active implementation until the new
-> product passes VM acceptance and an explicitly armed host canary.
-
-A macOS proxy stack that routes traffic through `local -> DMIT VPS (SSH relay) -> ISP proxy` with menu-bar mode switching (SwiftBar), system proxy support, and optional TUN mode.
-
-## What This Solves
-
-- Stable daily proxy path for browser/apps/CLI on macOS.
-- One-click mode switching from menu bar:
-  - `PROXY` (recommended stable)
-  - `TUN` (full-traffic coverage, admin required)
-  - `SURGE` (handoff back to Surge)
-  - `OFF` (direct)
-- Built-in diagnostics (`doctor`, `test`, TUN status/repair commands).
-- Built-in routing-scope verification for:
-  - system proxy traffic
-  - new terminals (shell env injection)
-  - old terminals still pinned to local `127.0.0.1:17890/17891`
-
-## Important Notes
-
-- This repository contains **no production credentials**.
-- `403` from services like Claude/ChatGPT is usually an **IP reputation / risk-control** issue, not a script bug.
-- TUN mode needs privileged launchd daemon install and may prompt macOS admin authentication.
-
-## Architecture
+本仓库保留 PersonalVPN 的研发历史，并整理后来采用的 **VPS 中继 + 固定 ISP 出口 + 成熟客户端** 方案。线路不绑定某个菜单 App，也不要求使用 PersonalVPN。Surge、FlClash 与自建 PersonalVPN 可以作为可选方案共存；同一设备同一时刻只选择一个接管默认流量和 DNS。
 
 ```text
-Apps / Browser / CLI
-      |
-      | (PROXY mode: system HTTP/SOCKS + shell env)
-      v
-local sing-box (127.0.0.1:17890/17891)
-      |
-      v
-SSH local forward (to DMIT VPS)
-      |
-      v
-Upstream ISP proxy (SOCKS5/HTTP)
-      |
-      v
-Internet
+Surge / FlClash(mihomo) / 其他兼容客户端
+       │ Hysteria2 或 AnyTLS（独立凭据、TLS）
+       ▼
+VPS 中继（本案例使用 DMIT）
+       │ SOCKS5，供应商允许的认证方式
+       ▼
+固定 ISP 出口（本案例使用 IPRoyal） → 互联网
 ```
 
-In `TUN` mode, root sing-box captures system traffic directly and routes final egress through the ISP upstream.
+**文档更新：2026-10-21。不是一键安装包，也不是生产 SLA。** 本次整理不部署、不安装、不切换网络；历史现场验证和当前可重复验收分开说明。
 
-## Requirements
+## 阅读顺序
 
-- macOS
-- `bash`, `curl`, `ssh`, `networksetup`, `launchctl`
-- `sing-box` (script can install via Homebrew)
-- Optional: `SwiftBar` for menu UI
-- Optional: `Surge` if you want Surge mode handoff
+1. [架构与客户端接入](docs/stable-isp/architecture-and-clients.md)：选型、单控制器、Surge/FlClash、DNS、微信例外、容器边界。
+2. [服务端与运维](docs/stable-isp/operations.md)：凭据、TLS、部署、容量和故障定位。
+3. [迁移与验收](docs/stable-isp/acceptance.md)：测试方法、历史证据与未验证项。
+4. [脱敏配置片段](examples/stable-isp/README.md)：保留地址和占位符，不能直接上线。
 
-## Quick Start
+## 当前与历史代码
 
-1. Prepare runtime variables (example):
+此轮发布只同步文档和脱敏片段。下表包含本地研发目录的定位，部分候选目录尚未发布到 Git；不存在的目录不是安装前置条件，也不表示此版本已经交付其实现。
 
-```bash
-export DMIT_HOST="your.dmit.vps.ip"
-export DMIT_PORT="443"
-export DMIT_USER="root"
+| 路径 | 定位 |
+|---|---|
+| `docs/stable-isp/`、`examples/stable-isp/` | 当前跨客户端参考，新采用者先读这里 |
+| `personal-vpn/Application/`、`TunnelExtension/` | 原生 Network Extension 研发候选，非已完成签名发布/生产验收的产品 |
+| `personal-vpn/ServerDeployment/` | 早期 Hysteria2 离线候选，不覆盖后来全部 AnyTLS 部署 |
+| `personal-vpn/LocalRuntime/`、`Packaging/` | 旧 root daemon / 独立 TUN 路径，不推荐新装 |
+| `scripts/`、`swiftbar/` | 旧 SSH relay 栈，见[历史说明](docs/legacy-ssh-stack.md) |
 
-export IPROYAL_HOST="your.isp.proxy.host"
-export IPROYAL_PORT="your.isp.proxy.port"
-export IPROYAL_USER="your.isp.user"
-export IPROYAL_PASS="your.isp.password"
+## 不变的原则
 
-# Either provide an existing SSH key, or a zip containing id_rsa.pem
-export KEY_TARGET="$HOME/.ssh/dmit_relay_id_rsa"
-# export KEY_ZIP="$HOME/path/to/relay-key.zip"
-```
+- 一个明确选定的客户端拥有默认流量与 DNS；不堆叠第二套 TUN 修补第一套。
+- SSH 仅管理；公网默认最终指向固定 ISP，无静默 DIRECT、订阅节点或其他出口回退。
+- 用户手动切换，监控只记录，不擅自切换配置、重启其他 VPN 或恢复旧 PersonalVPN。
+- 系统代理不等于终端/原生 App 全覆盖，Enhanced Mode/TUN 必须独立验收。
+- 局域网、维护通道及获准微信直连是明确例外，不声称这些流量也走 ISP。
+- 不写永久 DNS；停止后按基线验收。无策略回退不等于系统级 kill switch。
+- 生产配置、密码、订阅 URL、私钥和完整日志留在仓库外。历史工作区未经全面秘密审计，不可 `git add .` 后直接发布。
 
-2. Install:
-
-```bash
-cd data-series/dmit-iproyal-stack
-./scripts/install_all.sh
-```
-
-3. Use menu bar:
-
-- `Use Proxy (Stable)` for daily use
-- `Use TUN (Admin)` for full-coverage routing
-- `Use Surge` to hand off back to Surge
-
-## Modes
-
-- `stack-proxy`: system proxy + local proxy core + shell env
-- `stack-tun`: root TUN + optional proxy core retention for CLI compatibility
-- `surge`: system/browser handoff to Surge, while local `127.0.0.1:17890/17891` bridge to Surge for stale CLI sessions
-- `direct`: no system proxy, while local `127.0.0.1:17890/17891` bridge direct for stale CLI sessions
-
-## Core Commands
-
-```bash
-dmit-iproyal-proxyctl info
-dmit-iproyal-proxyctl doctor
-dmit-iproyal-proxyctl verify-scope
-dmit-iproyal-proxyctl verify-cli-apis
-dmit-iproyal-proxyctl session-sync
-
-dmit-iproyal-proxyctl use-stack-proxy-gui
-dmit-iproyal-proxyctl use-stack-tun-gui
-dmit-iproyal-proxyctl use-surge-gui
-dmit-iproyal-proxyctl use-direct-gui
-
-dmit-iproyal-proxyctl tun-status
-dmit-iproyal-proxyctl tun-loaded
-dmit-iproyal-proxyctl tun-running
-dmit-iproyal-proxyctl tun-repair-gui
-```
-
-## TUN Reliability Defaults
-
-- `TUN_MTU=1500`
-- `TUN_KEEP_PROXY_CORE=1`
-- `TUN_KEEP_SHELL_ENV=1`
-- Fast health probes + post-cutover validation + rollback to proxy mode
-- Persistent health monitor loop with stack-proxy self-repair before fallback
-
-## Scope Verification
-
-`verify-scope` validates the active mode against three practical surfaces:
-
-- `system_proxy`: whether macOS network services point to the expected proxy target
-- `new_terminal`: whether a freshly opened shell will inherit the intended local proxy env
-- `legacy_terminal`: whether already-open terminals/apps still pointing at local `127.0.0.1:17890/17891` can reach the expected upstream path
-
-In `stack-proxy`, the verifier also compares the local HTTP/SOCKS egress against the relay path so you can confirm traffic is actually leaving through `local -> DMIT VPS -> ISP proxy`.
-
-`verify-cli-apis` checks non-interactively whether the current relay/local/system paths can reach the official OpenAI and Anthropic API endpoints. Expected healthy unauthenticated responses are typically `401` or `405`, not `000`.
-
-`session-sync` is the one-shot repair command for an already-open shell. It applies the current shell state immediately, and in `zsh` it also attaches an auto-sync hook so future mode switches are picked up on the next prompt:
-
-- `stack-proxy` / `shell-proxy`: emit `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`
-- `surge` / `direct`: emit `unset ..._PROXY`
-
-Example:
-
-```bash
-eval "$(dmit-iproyal-proxyctl session-sync)"
-```
-
-After this one-time attach, an interactive `zsh` session will re-read `~/.config/dmit-iproyal/shell_proxy.env` on each prompt, so menu-bar mode changes no longer require reopening the terminal.
-
-## Troubleshooting
-
-- `SOCKS proxy invalid response`: check upstream proxy protocol/account and relay path.
-- `stack-proxy` suddenly loses connectivity: the health monitor now tries `relay + sing-box` repair first, then falls back to `surge` if the relay cannot be recovered.
-- `stream disconnected` in CLI after switching: use current codebase defaults (`TUN_KEEP_PROXY_CORE=1`, `TUN_KEEP_SHELL_ENV=1`).
-- Existing terminal still points at old local proxy after switching: current code keeps local proxy ports alive and rewires them to `surge` or `direct` to avoid long hangs; if a command is already blocked, interrupt once and rerun.
-- `403 forbidden`: replace egress IP/provider; this is typically reputation-based.
-
-## Security
-
-- Do not commit real credentials or private keys.
-- Prefer environment variables or secure local secret storage.
-- Keep `~/.config/dmit-iproyal/env` local-only.
-
-## Project Layout
-
-- `scripts/`: setup, control, launchd/TUN install scripts
-- `swiftbar/`: menu bar plugin
+旧文档冲突时，以此入口及 `docs/stable-isp/` 为当前采用说明；旧代码不会因文档更新而改变行为。

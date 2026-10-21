@@ -1,0 +1,38 @@
+# FRAGMENT ONLY. Not a complete FlClash/TUN configuration.
+mode: rule
+allow-lan: false
+proxies:
+  - name: Stable ISP
+    type: anytls
+    server: 192.0.2.10
+    port: 9443
+    password: REPLACE_CLIENT_SECRET
+    sni: vpn.example.com
+    fingerprint: REPLACE_CERT_SHA256
+    skip-cert-verify: false
+    udp: true
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  enhanced-mode: redir-host
+  respect-rules: true
+  nameserver:
+    - https://1.1.1.1/dns-query
+  fallback: []
+  # Review bootstrap resolvers for the target network.
+  proxy-server-nameserver:
+    - 223.5.5.5
+  # If using WeChat DIRECT rules, review corresponding direct DNS policies:
+  # nameserver-policy:
+  #   '+.mmbiz.qpic.cn': '223.5.5.5#DIRECT'
+rules:
+  # Optional macOS rule; verify actual process path.
+  # - 'PROCESS-PATH-REGEX,^/Applications/WeChat[.]app/.*,DIRECT'
+  # - DOMAIN-SUFFIX,weixin.qq.com,DIRECT
+  # - DOMAIN-SUFFIX,mmbiz.qpic.cn,DIRECT
+  # - DOMAIN-SUFFIX,wx.qlogo.cn,DIRECT
+  - DOMAIN-SUFFIX,local,DIRECT
+  - IP-CIDR,192.0.2.10/32,DIRECT,no-resolve
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - MATCH,Stable ISP
